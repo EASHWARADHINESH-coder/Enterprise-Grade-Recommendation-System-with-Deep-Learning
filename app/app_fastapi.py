@@ -1,333 +1,218 @@
-from pathlib import Path
-from typing import List
+"""
+Application Layer - FastAPI Recommendation Service
+==================================================
+Enterprise-Grade Recommendation System with Deep Learning
 
-import pickle
-import numpy as np
-import pandas as pd
-import torch
+Serves the hybrid recommender over HTTP.
+
+Endpoints:
+    GET  /                        service metadata and health
+    GET  /health                  readiness probe
+    GET  /recommend/{user_id}     personalised top-N with explanations
+    GET  /similar-items/{item_id} content-similar products
+    GET  /users/{user_id}         customer profile and engagement summary
+    GET  /items/{item_id}         product detail
+    POST /recommend/batch         batch scoring for offline jobs
+
+The recommendation logic lives entirely in models/hybrid_recommender.py. This
+module is transport only - request validation, response shaping, error mapping.
+Keeping the split clean is what lets the Streamlit dashboard and this API return
+identical recommendations for the same customer.
+
+Run:
+    uvicorn app_fastapi:app --reload --port 8000    (from the app/ directory)
+    python app/app_fastapi.py                       (equivalent, from the root)
+
+Then open http://127.0.0.1:8000/docs
+"""
+
+import os
+import sys
 from contextlib import asynccontextmanager
+
+import pandas as pd
 from fastapi import FastAPI, HTTPException, Query
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
-from data_loader import load_users, load_movies, load_ratings
-from preprocessing import (
-    create_user_item_matrix,
-    create_normalized_user_item_matrix,
-    create_movie_popularity_features
+BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.append(os.path.join(BASE_DIR, "src"))
+sys.path.append(os.path.join(BASE_DIR, "models"))
+
+from explainability import (
+    attribute_signals,
+    build_full_explanation,
+    explain_recommendation,
+    explain_similar_item,
+    explain_via_similar_items,
+    explain_via_similar_users,
+    render_similar_user_evidence,
 )
-from baseline_recommenders import (
-    create_svd_model,
-    create_predicted_rating_matrix
-)
-from content_based_nlp import (
-    create_tfidf_features,
-    create_content_similarity_matrix,
-    recommend_similar_movies,
-    recommend_for_existing_user,
-    recommend_for_new_user_by_preference
-)
-from ncf_recommender import (
-    NeuralCollaborativeFiltering,
-    recommend_ncf
-)
+from hybrid_recommender import HybridRecommender
 
 
 # =========================================================
-# PATHS
+# SETTINGS
 # =========================================================
-BASE_DIR = Path(__file__).resolve().parent
-ARTIFACTS_DIR = BASE_DIR / "saved_models"
+SERVICE_TITLE = "Enterprise-Grade Recommendation System with Deep Learning"
+SERVICE_VERSION = "3.0.0"
+DOMAIN = "E-Commerce / Retail"
 
-NCF_MODEL_PATH = ARTIFACTS_DIR / "ncf_model.pt"
-USER_TO_INDEX_PATH = ARTIFACTS_DIR / "user_to_index.pkl"
-ITEM_TO_INDEX_PATH = ARTIFACTS_DIR / "item_to_index.pkl"
+MAX_TOP_N = 50
+MAX_BATCH_USERS = 100
 
-
-# =========================================================
-# GLOBAL OBJECTS
-# =========================================================
-users_df = None
-movies_df = None
-ratings_df = None
-
-user_item_matrix = None
-predicted_ratings_df = None
-
-movies_with_desc = None
-tfidf_matrix = None
-content_similarity_df = None
-
-ncf_model = None
-user_to_index = None
-item_to_index = None
-
-popularity_lookup = None
+# Populated at startup by the lifespan handler.
+recommender = None
 
 
 # =========================================================
 # RESPONSE MODELS
+# Pydantic models are the API contract. They also do the output validation:
+# if a scoring change ever starts emitting nulls where a price is expected,
+# the response fails here rather than silently reaching the storefront.
 # =========================================================
+class SignalContribution(BaseModel):
+    signal: str
+    raw_score: float
+    weight: float
+    contribution: float
+    contribution_share: float
+
+
 class RecommendationItem(BaseModel):
-    movie_id: int
+    item_id: int
     title: str
-    genre: str
-    language: str
-    imdb_rating: float
-    popularity_score: float | None = None
+    category: str
+    brand: str | None = None
+    price: float
+    score: float = Field(..., description="Final hybrid score after re-ranking")
     explanation: str
+    is_long_tail: bool | None = None
+    signal_breakdown: list[SignalContribution] | None = None
 
 
 class RecommendationResponse(BaseModel):
     user_id: int
-    strategy: str
+    strategy: str = Field(..., description="hybrid_fusion | cold_start_user_profile | global_popularity_fallback")
     top_n: int
-    recommendations: List[RecommendationItem]
+    user_segment: str | None = None
+    interaction_count: int
+    recommendations: list[RecommendationItem]
+
+    # Business context: what this recommendation set is worth if it converts.
+    total_basket_value: float = Field(..., description="Sum of recommended item prices, INR")
+    average_price: float
 
 
-class SimilarItemResponse(BaseModel):
+class SimilarItem(BaseModel):
     item_id: int
+    title: str
+    category: str
+    brand: str | None = None
+    price: float
+    similarity_score: float
+    explanation: str
+
+
+class SimilarItemsResponse(BaseModel):
+    item_id: int
+    source_title: str
+    source_category: str
     top_n: int
-    similar_items: List[RecommendationItem]
+    similar_items: list[SimilarItem]
+
+
+class UserProfileResponse(BaseModel):
+    user_id: int
+    age: int
+    gender: str
+    location: str
+    user_segment: str
+    preferred_category: str
+    interaction_count: int
+    is_cold_start: bool
+
+
+class ItemDetailResponse(BaseModel):
+    item_id: int
+    title: str
+    category: str
+    subcategory: str | None = None
+    brand: str | None = None
+    price: float
+    description: str
+    content_tags: list[str]
+    interaction_count: int
+    is_long_tail: bool
+
+
+class BatchRequest(BaseModel):
+    user_ids: list[int] = Field(..., min_length=1, max_length=MAX_BATCH_USERS)
+    top_n: int = Field(10, ge=1, le=MAX_TOP_N)
+
+
+class BatchResponse(BaseModel):
+    requested: int
+    served: int
+    results: dict[str, list[int]]
 
 
 # =========================================================
 # HELPERS
 # =========================================================
-def build_popularity_lookup(movie_popularity_features: pd.DataFrame) -> pd.DataFrame:
-    df = movie_popularity_features.copy()
-    df["popularity_penalty"] = 1 / (1 + np.log1p(df["interaction_count"]))
-    df["long_tail_boost"] = np.where(df["is_long_tail"] == 1, 1.15, 1.00)
-    return df.set_index("movie_id")
-
-
-def min_max_normalize(score_series: pd.Series) -> pd.Series:
-    if len(score_series) == 0:
-        return score_series.astype(float)
-
-    score_series = score_series.astype(float)
-    min_val = score_series.min()
-    max_val = score_series.max()
-
-    if max_val == min_val:
-        return pd.Series(0.0, index=score_series.index)
-
-    return (score_series - min_val) / (max_val - min_val)
-
-
-def load_pickle_file(path: Path):
-    if not path.exists():
-        raise FileNotFoundError(f"Required file not found: {path}")
-    with open(path, "rb") as f:
-        return pickle.load(f)
-
-
-def load_ncf_artifacts():
-    if not NCF_MODEL_PATH.exists():
-        raise FileNotFoundError(
-            f"NCF model file not found: {NCF_MODEL_PATH}\n"
-            f"Train and save the model first."
-        )
-    if not USER_TO_INDEX_PATH.exists():
-        raise FileNotFoundError(
-            f"user_to_index file not found: {USER_TO_INDEX_PATH}"
-        )
-    if not ITEM_TO_INDEX_PATH.exists():
-        raise FileNotFoundError(
-            f"item_to_index file not found: {ITEM_TO_INDEX_PATH}"
+def require_ready():
+    """Guard every route: a half-loaded service must fail loudly, not silently."""
+    if recommender is None:
+        raise HTTPException(
+            status_code=503,
+            detail="Recommendation service is still initialising or failed to load artifacts.",
         )
 
-    local_user_to_index = load_pickle_file(USER_TO_INDEX_PATH)
-    local_item_to_index = load_pickle_file(ITEM_TO_INDEX_PATH)
 
-    model = torch.load(NCF_MODEL_PATH, map_location=torch.device("cpu"))
-
-    if hasattr(model, "eval"):
-        model.eval()
-
-    return model, local_user_to_index, local_item_to_index
+def safe_float(value, default=0.0):
+    return default if value is None or pd.isna(value) else float(value)
 
 
-def get_collaborative_scores(user_id: int) -> pd.Series:
-    if user_id not in user_item_matrix.index:
-        return pd.Series(dtype=float)
-
-    already_rated = user_item_matrix.loc[user_id]
-    already_rated_movies = already_rated[already_rated > 0].index
-
-    scores = predicted_ratings_df.loc[user_id].drop(already_rated_movies, errors="ignore")
-    scores = min_max_normalize(scores)
-    return scores.sort_values(ascending=False)
+def safe_str(value, default=None):
+    return default if value is None or pd.isna(value) else str(value)
 
 
-def get_content_scores(user_id: int) -> pd.Series:
-    try:
-        rec_df = recommend_for_existing_user(
-            user_id=user_id,
-            ratings_df=ratings_df,
-            movies_df=movies_with_desc,
-            tfidf_matrix=tfidf_matrix,
-            n_top=len(movies_with_desc)
+def build_recommendation_items(user_id, frame, include_breakdown):
+    """Convert the recommender's DataFrame into validated response objects."""
+    items = []
+
+    for _, row in frame.iterrows():
+        breakdown = None
+        if include_breakdown and "item_cf_score" in row.index:
+            attribution = attribute_signals(row, recommender.weights)
+            breakdown = [
+                SignalContribution(
+                    signal=str(entry["signal"]),
+                    raw_score=round(float(entry["raw_score"]), 4),
+                    weight=float(entry["weight"]),
+                    contribution=round(float(entry["contribution"]), 4),
+                    contribution_share=round(float(entry["contribution_share"]), 4),
+                )
+                for entry in attribution.to_dict("records")
+            ]
+
+        items.append(
+            RecommendationItem(
+                item_id=int(row["item_id"]),
+                title=safe_str(row.get("title"), "Unknown"),
+                category=safe_str(row.get("category"), "Unknown"),
+                brand=safe_str(row.get("brand")),
+                price=safe_float(row.get("price")),
+                score=round(safe_float(row.get("hybrid_score")), 6),
+                explanation=explain_recommendation(recommender, user_id, row),
+                is_long_tail=(
+                    bool(row["is_long_tail"]) if "is_long_tail" in row.index
+                    and pd.notna(row["is_long_tail"]) else None
+                ),
+                signal_breakdown=breakdown,
+            )
         )
-    except Exception:
-        return pd.Series(dtype=float)
 
-    if rec_df.empty:
-        return pd.Series(dtype=float)
-
-    scores = pd.Series(
-        data=rec_df["similarity_score"].values,
-        index=rec_df["movie_id"].values
-    )
-    scores = min_max_normalize(scores)
-    return scores.sort_values(ascending=False)
-
-
-def get_ncf_scores(user_id: int) -> pd.Series:
-    if ncf_model is None or user_to_index is None or item_to_index is None:
-        return pd.Series(dtype=float)
-
-    if user_id not in user_to_index:
-        return pd.Series(dtype=float)
-
-    rec_df = recommend_ncf(
-        model=ncf_model,
-        user_id=user_id,
-        ratings_df=ratings_df,
-        movies_df=movies_df,
-        user_to_index=user_to_index,
-        item_to_index=item_to_index,
-        top_n=len(movies_df),
-        feedback_type="explicit"
-    )
-
-    if rec_df.empty:
-        return pd.Series(dtype=float)
-
-    scores = pd.Series(
-        data=rec_df["predicted_score"].values,
-        index=rec_df["movie_id"].values
-    )
-    scores = min_max_normalize(scores)
-    return scores.sort_values(ascending=False)
-
-
-def apply_popularity_reranking(score_series: pd.Series) -> pd.DataFrame:
-    recommendation_df = pd.DataFrame({"raw_score": score_series})
-
-    recommendation_df = recommendation_df.join(
-        popularity_lookup[
-            ["interaction_count", "average_rating", "is_long_tail", "popularity_penalty", "long_tail_boost"]
-        ],
-        how="left"
-    )
-
-    recommendation_df["interaction_count"] = recommendation_df["interaction_count"].fillna(0)
-    recommendation_df["average_rating"] = recommendation_df["average_rating"].fillna(0)
-    recommendation_df["is_long_tail"] = recommendation_df["is_long_tail"].fillna(1)
-    recommendation_df["popularity_penalty"] = recommendation_df["popularity_penalty"].fillna(1.0)
-    recommendation_df["long_tail_boost"] = recommendation_df["long_tail_boost"].fillna(1.0)
-
-    recommendation_df["adjusted_score"] = (
-        recommendation_df["raw_score"]
-        * recommendation_df["popularity_penalty"]
-        * recommendation_df["long_tail_boost"]
-    )
-
-    return recommendation_df.sort_values("adjusted_score", ascending=False)
-
-
-def fuse_scores(
-    collaborative_scores: pd.Series,
-    content_scores: pd.Series,
-    ncf_scores: pd.Series
-) -> pd.DataFrame:
-    all_movie_ids = set(collaborative_scores.index) | set(content_scores.index) | set(ncf_scores.index)
-
-    fused = pd.DataFrame(index=list(all_movie_ids))
-    fused["collaborative_score"] = collaborative_scores.reindex(fused.index).fillna(0.0)
-    fused["content_score"] = content_scores.reindex(fused.index).fillna(0.0)
-    fused["ncf_score"] = ncf_scores.reindex(fused.index).fillna(0.0)
-
-    fused["hybrid_raw_score"] = (
-        0.35 * fused["collaborative_score"] +
-        0.25 * fused["content_score"] +
-        0.40 * fused["ncf_score"]
-    )
-
-    reranked = apply_popularity_reranking(fused["hybrid_raw_score"])
-    fused = fused.join(reranked[["adjusted_score"]], how="left")
-    return fused.sort_values("adjusted_score", ascending=False)
-
-
-def explain_recommendation(user_id: int, movie_id: int, fused_row: pd.Series) -> str:
-    user_row = users_df.loc[users_df["user_id"] == user_id]
-    movie_row = movies_df.loc[movies_df["movie_id"] == movie_id]
-
-    if user_row.empty or movie_row.empty:
-        return "Recommended based on hybrid recommendation signals."
-
-    preferred_category = user_row.iloc[0]["preferred_category"]
-    genre = movie_row.iloc[0]["genre"]
-
-    reasons = []
-
-    if genre == preferred_category:
-        reasons.append(f"matches your preferred category '{preferred_category}'")
-
-    if fused_row.get("content_score", 0) > 0.5:
-        reasons.append("has high content similarity to movies you liked")
-
-    if fused_row.get("collaborative_score", 0) > 0.5:
-        reasons.append("is supported by collaborative filtering patterns")
-
-    if fused_row.get("ncf_score", 0) > 0.5:
-        reasons.append("received a strong deep learning recommendation score")
-
-    if movie_id in popularity_lookup.index:
-        if popularity_lookup.loc[movie_id, "is_long_tail"] == 1:
-            reasons.append("was boosted as a promising long-tail item")
-        else:
-            reasons.append("has strong overall popularity")
-
-    if not reasons:
-        return "Recommended using a fusion of collaborative, content-based, and deep learning signals."
-
-    return "Recommended because it " + ", ".join(reasons) + "."
-
-
-def cold_start_recommendations(user_id: int, top_n: int) -> pd.DataFrame:
-    user_row = users_df.loc[users_df["user_id"] == user_id]
-
-    if user_row.empty:
-        fallback = movies_df[
-            ["movie_id", "title", "genre", "language", "imdb_rating", "popularity_score"]
-        ].copy()
-
-        fallback = fallback.sort_values(
-            by=["imdb_rating", "popularity_score"],
-            ascending=False
-        ).head(top_n)
-
-        fallback["explanation"] = "Recommended using global popularity fallback for a new user."
-        return fallback
-
-    preferred_genre = user_row.iloc[0]["preferred_category"]
-
-    fallback = recommend_for_new_user_by_preference(
-        preferred_genre=preferred_genre,
-        movies_df=movies_with_desc,
-        n_top=top_n
-    ).copy()
-
-    fallback["explanation"] = (
-        f"Recommended using cold-start fallback based on your preferred category '{preferred_genre}'."
-    )
-    return fallback
-
-
-def validate_service_ready():
-    if users_df is None or movies_df is None or ratings_df is None:
-        raise HTTPException(status_code=500, detail="Service not initialized.")
+    return items
 
 
 # =========================================================
@@ -335,208 +220,301 @@ def validate_service_ready():
 # =========================================================
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global users_df, movies_df, ratings_df
-    global user_item_matrix, predicted_ratings_df
-    global movies_with_desc, tfidf_matrix, content_similarity_df
-    global ncf_model, user_to_index, item_to_index
-    global popularity_lookup
+    """
+    Load all model artifacts once at startup.
 
-    users_df = load_users()
-    movies_df = load_movies()
-    ratings_df = load_ratings()
+    Loading here rather than per-request matters: the similarity matrices are
+    several hundred megabytes, and reloading them per call would put response
+    times in the tens of seconds.
+    """
+    global recommender
 
-    user_item_matrix_local = create_user_item_matrix(ratings_df)
-    normalized_user_item_matrix = create_normalized_user_item_matrix(ratings_df)
-
-    _, user_factors_df, item_factors_df = create_svd_model(
-        normalized_user_item_matrix,
-        n_components=50
-    )
-
-    predicted_ratings_df_local = create_predicted_rating_matrix(
-        normalized_user_item_matrix,
-        user_factors_df,
-        item_factors_df
-    )
-
-    movie_popularity_features = create_movie_popularity_features(ratings_df)
-    popularity_lookup_local = build_popularity_lookup(movie_popularity_features)
-
-    movies_with_desc_local, _, tfidf_matrix_local = create_tfidf_features(movies_df)
-    content_similarity_df_local = create_content_similarity_matrix(
-        movies_with_desc_local,
-        tfidf_matrix_local
-    )
-
-    # Load pre-trained NCF artifacts instead of training on startup
+    print("Loading recommendation artifacts ...")
     try:
-        ncf_model_local, user_to_index_local, item_to_index_local = load_ncf_artifacts()
-    except Exception:
-        ncf_model_local, user_to_index_local, item_to_index_local = None, {}, {}
-
-    user_item_matrix = user_item_matrix_local
-    predicted_ratings_df = predicted_ratings_df_local
-    popularity_lookup = popularity_lookup_local
-    movies_with_desc = movies_with_desc_local
-    tfidf_matrix = tfidf_matrix_local
-    content_similarity_df = content_similarity_df_local
-    ncf_model = ncf_model_local
-    user_to_index = user_to_index_local
-    item_to_index = item_to_index_local
+        recommender = HybridRecommender.load()
+        print("  users        : {:,}".format(len(recommender.users_df)))
+        print("  items        : {:,}".format(len(recommender.items_df)))
+        print("  interactions : {:,}".format(len(recommender.interactions_df)))
+        print("  NCF loaded   : {}".format(recommender.ncf_model is not None))
+        print("Service ready.")
+    except FileNotFoundError as exc:
+        # Do not start pretending to be healthy. A recommender missing its
+        # artifacts should refuse requests, not serve degraded results silently.
+        print("FAILED to load artifacts: {}".format(exc))
+        print("Run the pipeline first - see README Quickstart.")
+        recommender = None
 
     yield
 
+    print("Shutting down recommendation service.")
 
-# =========================================================
-# FASTAPI APP
-# =========================================================
+
 app = FastAPI(
-    title="Movie Recommendation Service",
-    description="FastAPI Recommendation API with Hybrid + Similar Items endpoints",
-    version="2.0.0",
-    lifespan=lifespan
+    title=SERVICE_TITLE,
+    description=(
+        "Hybrid recommendation service for an e-commerce catalogue. "
+        "Combines item-based collaborative filtering, latent-factor CF, "
+        "TF-IDF content similarity, and a PyTorch Neural Collaborative "
+        "Filtering model, with explainable output and cold-start fallback."
+    ),
+    version=SERVICE_VERSION,
+    lifespan=lifespan,
 )
 
 
 # =========================================================
-# ROOT
+# ROOT / HEALTH
 # =========================================================
 @app.get("/")
 def root():
     return {
-        "message": "Movie Recommendation FastAPI Service is running",
-        "docs": "/docs",
+        "service": SERVICE_TITLE,
+        "domain": DOMAIN,
+        "version": SERVICE_VERSION,
+        "status": "ready" if recommender is not None else "unavailable",
         "endpoints": [
             "/recommend/{user_id}",
-            "/similar-items/{item_id}"
-        ]
+            "/similar-items/{item_id}",
+            "/users/{user_id}",
+            "/items/{item_id}",
+            "/recommend/batch",
+            "/docs",
+        ],
+    }
+
+
+@app.get("/health")
+def health():
+    if recommender is None:
+        raise HTTPException(status_code=503, detail="Artifacts not loaded.")
+
+    return {
+        "status": "healthy",
+        "users": len(recommender.users_df),
+        "items": len(recommender.items_df),
+        "ncf_available": recommender.ncf_model is not None,
+        "fusion_weights": recommender.weights,
     }
 
 
 # =========================================================
-# RECOMMEND ENDPOINT
+# RECOMMEND
 # =========================================================
 @app.get("/recommend/{user_id}", response_model=RecommendationResponse)
-def recommend(user_id: int, top_n: int = Query(10, ge=1, le=50)):
-    validate_service_ready()
+def recommend(
+    user_id: int,
+    top_n: int = Query(10, ge=1, le=MAX_TOP_N, description="Number of items to return"),
+    explain: bool = Query(True, description="Include per-signal score attribution"),
+):
+    """
+    Personalised recommendations for a customer.
 
-    user_known = user_id in set(users_df["user_id"].unique())
-    user_has_history = (
-        user_id in user_item_matrix.index
-        and not ratings_df.loc[ratings_df["user_id"] == user_id].empty
-    )
+    Always returns a `strategy` field. An unknown or inactive customer is served
+    through a cold-start path and labelled as such rather than being presented
+    as a personalised result - a caller must be able to tell the difference.
+    """
+    require_ready()
 
-    if not user_has_history:
-        fallback_df = cold_start_recommendations(user_id, top_n=top_n)
+    if user_id < 1:
+        raise HTTPException(status_code=422, detail="user_id must be a positive integer.")
 
-        recommendations = [
-            RecommendationItem(
-                movie_id=int(row["movie_id"]),
-                title=str(row["title"]),
-                genre=str(row["genre"]),
-                language=str(row["language"]),
-                imdb_rating=float(row["imdb_rating"]),
-                popularity_score=float(row["popularity_score"]) if pd.notna(row["popularity_score"]) else None,
-                explanation=str(row["explanation"])
-            )
-            for _, row in fallback_df.iterrows()
-        ]
+    frame = recommender.recommend(user_id, top_n=top_n)
 
-        strategy = "cold_start_fallback" if user_known else "global_fallback"
-
-        return RecommendationResponse(
-            user_id=user_id,
-            strategy=strategy,
-            top_n=top_n,
-            recommendations=recommendations
+    if frame.empty:
+        raise HTTPException(
+            status_code=404,
+            detail="No recommendations could be generated for user {}.".format(user_id),
         )
 
-    collaborative_scores = get_collaborative_scores(user_id)
-    content_scores = get_content_scores(user_id)
-    ncf_scores = get_ncf_scores(user_id)
-
-    fused_scores = fuse_scores(
-        collaborative_scores=collaborative_scores,
-        content_scores=content_scores,
-        ncf_scores=ncf_scores
-    )
-
-    top_df = fused_scores.head(top_n).reset_index().rename(columns={"index": "movie_id"})
-    top_df = top_df.merge(
-        movies_df[["movie_id", "title", "genre", "language", "imdb_rating", "popularity_score"]],
-        on="movie_id",
-        how="left"
-    )
-
-    recommendations = []
-    for _, row in top_df.iterrows():
-        explanation = explain_recommendation(
-            user_id=user_id,
-            movie_id=int(row["movie_id"]),
-            fused_row=row
-        )
-
-        recommendations.append(
-            RecommendationItem(
-                movie_id=int(row["movie_id"]),
-                title=str(row["title"]),
-                genre=str(row["genre"]),
-                language=str(row["language"]),
-                imdb_rating=float(row["imdb_rating"]),
-                popularity_score=float(row["popularity_score"]) if pd.notna(row["popularity_score"]) else None,
-                explanation=explanation
-            )
-        )
+    items = build_recommendation_items(user_id, frame, include_breakdown=explain)
+    profile = recommender.user_details(user_id)
+    prices = [item.price for item in items]
 
     return RecommendationResponse(
         user_id=user_id,
-        strategy="hybrid_fusion",
-        top_n=top_n,
-        recommendations=recommendations
+        strategy=str(frame["strategy"].iloc[0]),
+        top_n=len(items),
+        user_segment=safe_str(profile["user_segment"]) if profile is not None else None,
+        interaction_count=recommender.user_interaction_count(user_id),
+        recommendations=items,
+        total_basket_value=round(sum(prices), 2),
+        average_price=round(sum(prices) / len(prices), 2) if prices else 0.0,
     )
 
 
 # =========================================================
-# SIMILAR ITEMS ENDPOINT
+# SIMILAR ITEMS
 # =========================================================
-@app.get("/similar-items/{item_id}", response_model=SimilarItemResponse)
-def similar_items(item_id: int, top_n: int = Query(10, ge=1, le=50)):
-    validate_service_ready()
+@app.get("/similar-items/{item_id}", response_model=SimilarItemsResponse)
+def similar_items(
+    item_id: int,
+    top_n: int = Query(10, ge=1, le=MAX_TOP_N),
+):
+    """
+    Content-similar products.
 
-    if item_id not in set(movies_df["movie_id"].unique()):
-        raise HTTPException(status_code=404, detail=f"movie_id {item_id} not found.")
+    Driven purely by TF-IDF over the product text, so it works for any item in
+    the catalogue - including one listed today with zero sales history.
+    """
+    require_ready()
 
-    rec_df = recommend_similar_movies(
-        movie_id=item_id,
-        movies_df=movies_with_desc,
-        similarity_df=content_similarity_df,
-        n_top=top_n
-    )
+    source = recommender.item_details(item_id)
+    if source is None:
+        raise HTTPException(status_code=404, detail="item_id {} not found.".format(item_id))
 
-    similar_items_list = []
+    frame = recommender.similar_items(item_id, top_n=top_n)
 
-    base_movie = movies_df.loc[movies_df["movie_id"] == item_id].iloc[0]
-
-    for _, row in rec_df.iterrows():
-        explanation = (
-            f"Similar to '{base_movie['title']}' based on TF-IDF description similarity, "
-            f"shared genre/language/production metadata, and cosine similarity score."
+    results = [
+        SimilarItem(
+            item_id=int(row["item_id"]),
+            title=safe_str(row.get("title"), "Unknown"),
+            category=safe_str(row.get("category"), "Unknown"),
+            brand=safe_str(row.get("brand")),
+            price=safe_float(row.get("price")),
+            similarity_score=round(safe_float(row.get("similarity_score")), 4),
+            explanation=explain_similar_item(recommender, item_id, int(row["item_id"])),
         )
+        for _, row in frame.iterrows()
+    ]
 
-        similar_items_list.append(
-            RecommendationItem(
-                movie_id=int(row["movie_id"]),
-                title=str(row["title"]),
-                genre=str(row["genre"]),
-                language=str(row["language"]),
-                imdb_rating=float(row["imdb_rating"]),
-                popularity_score=float(row["popularity_score"]) if "popularity_score" in row and pd.notna(row["popularity_score"]) else None,
-                explanation=explanation
-            )
-        )
-
-    return SimilarItemResponse(
+    return SimilarItemsResponse(
         item_id=item_id,
-        top_n=top_n,
-        similar_items=similar_items_list
+        source_title=safe_str(source["title"], "Unknown"),
+        source_category=safe_str(source["category"], "Unknown"),
+        top_n=len(results),
+        similar_items=results,
     )
+
+
+# =========================================================
+# USER PROFILE
+# =========================================================
+@app.get("/users/{user_id}", response_model=UserProfileResponse)
+def get_user(user_id: int):
+    """Customer profile plus the engagement state that drives recommendation strategy."""
+    require_ready()
+
+    profile = recommender.user_details(user_id)
+    if profile is None:
+        raise HTTPException(status_code=404, detail="user_id {} not found.".format(user_id))
+
+    return UserProfileResponse(
+        user_id=user_id,
+        age=int(profile["age"]),
+        gender=safe_str(profile["gender"], "Unknown"),
+        location=safe_str(profile["location"], "Unknown"),
+        user_segment=safe_str(profile["user_segment"], "Unknown"),
+        preferred_category=safe_str(profile["preferred_category"], "Unknown"),
+        interaction_count=recommender.user_interaction_count(user_id),
+        is_cold_start=recommender.is_cold_start_user(user_id),
+    )
+
+
+# =========================================================
+# ITEM DETAIL
+# =========================================================
+@app.get("/items/{item_id}", response_model=ItemDetailResponse)
+def get_item(item_id: int):
+    """Product detail, including whether it sits in the long tail."""
+    require_ready()
+
+    item = recommender.item_details(item_id)
+    if item is None:
+        raise HTTPException(status_code=404, detail="item_id {} not found.".format(item_id))
+
+    interaction_count = 0
+    is_long_tail = True
+    if item_id in recommender.popularity_lookup.index:
+        row = recommender.popularity_lookup.loc[item_id]
+        interaction_count = int(row["interaction_count"])
+        is_long_tail = bool(row["is_long_tail"])
+
+    tags = [t for t in str(item.get("content_tags", "")).split("|") if t]
+
+    return ItemDetailResponse(
+        item_id=item_id,
+        title=safe_str(item["title"], "Unknown"),
+        category=safe_str(item["category"], "Unknown"),
+        subcategory=safe_str(item.get("subcategory")),
+        brand=safe_str(item.get("brand")),
+        price=safe_float(item.get("price")),
+        description=safe_str(item.get("description"), ""),
+        content_tags=tags,
+        interaction_count=interaction_count,
+        is_long_tail=is_long_tail,
+    )
+
+
+# =========================================================
+# EXPLANATION DETAIL
+# =========================================================
+@app.get("/explain/{user_id}/{item_id}")
+def explain(user_id: int, item_id: int):
+    """
+    Full three-part explanation for one recommendation.
+
+    Returns the same structured evidence the dashboard renders: signal
+    attribution, the customer's own comparable purchases, similar-customer
+    evidence, and the content terms that link the items.
+    """
+    require_ready()
+
+    if recommender.item_details(item_id) is None:
+        raise HTTPException(status_code=404, detail="item_id {} not found.".format(item_id))
+
+    frame = recommender.recommend(user_id, top_n=50)
+    match = frame.loc[frame["item_id"] == item_id]
+
+    if match.empty:
+        # The item is not in this user's current top 50; still explain what
+        # evidence exists rather than returning nothing useful.
+        neighbours = explain_via_similar_users(recommender, user_id, item_id)
+        return {
+            "user_id": user_id,
+            "item_id": item_id,
+            "in_current_recommendations": False,
+            "similar_items_evidence": explain_via_similar_items(
+                recommender, user_id, item_id).to_dict("records"),
+            "similar_users_evidence": neighbours,
+            "similar_users_summary": render_similar_user_evidence(neighbours),
+        }
+
+    explanation = build_full_explanation(recommender, user_id, match.iloc[0])
+    explanation["in_current_recommendations"] = True
+    explanation["similar_users_summary"] = render_similar_user_evidence(
+        explanation["similar_users_evidence"]
+    )
+    return explanation
+
+
+# =========================================================
+# BATCH PREDICTION
+# =========================================================
+@app.post("/recommend/batch", response_model=BatchResponse)
+def recommend_batch(request: BatchRequest):
+    """
+    Score many customers in one call.
+
+    Exists for the offline path - nightly email campaigns and pre-computed
+    homepage slots - where per-user HTTP round trips would dominate the runtime.
+    """
+    require_ready()
+
+    results = {}
+    for user_id in request.user_ids:
+        frame = recommender.recommend(user_id, top_n=request.top_n)
+        results[str(user_id)] = (
+            [] if frame.empty else [int(i) for i in frame["item_id"].tolist()]
+        )
+
+    return BatchResponse(
+        requested=len(request.user_ids),
+        served=sum(1 for v in results.values() if v),
+        results=results,
+    )
+
+
+if __name__ == "__main__":
+    import uvicorn
+
+    uvicorn.run(app, host="127.0.0.1", port=8000)

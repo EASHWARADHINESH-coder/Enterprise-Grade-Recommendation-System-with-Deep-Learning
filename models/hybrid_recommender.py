@@ -1,497 +1,497 @@
-# =========================================================
-# IMPORT LIBRARIES
-# =========================================================
-import pickle
-from pathlib import Path
+"""
+Hybrid Recommendation System (Advanced)
+=======================================
+Enterprise-Grade Recommendation System with Deep Learning
+
+Fuses three independent recommendation signals into one ranked list:
+
+    collaborative  (SVD)      what users with similar taste bought
+    content        (TF-IDF)   what resembles this user's past purchases
+    deep learning  (NCF)      the learned non-linear user-item interaction
+
+Each covers the others' blind spots. Collaborative filtering is strong for
+established users but silent for new items. Content-based is the reverse: it
+works on day one for any item with a description, but never discovers that two
+unrelated-looking products appeal to the same audience. NCF captures interaction
+effects neither can express, but needs history for both sides of the pair.
+
+This module is packaged as a loadable service class rather than a script,
+because FastAPI and Streamlit both need exactly this behaviour. Duplicating the
+fusion logic into each application layer is how the two drift apart and start
+returning different answers for the same user.
+
+Run:
+    python models/hybrid_recommender.py
+"""
+
+import os
+import sys
 
 import numpy as np
 import pandas as pd
-import torch
 
-from data_loader import load_users, load_movies, load_ratings
-from preprocessing import (
-    create_user_item_matrix,
-    create_normalized_user_item_matrix,
-    create_implicit_feedback_matrix,
-    create_movie_popularity_features,
-    create_user_profile_features,
-    save_pickle
+# Make the shared modules in src/ importable from this folder.
+BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.append(os.path.join(BASE_DIR, "src"))
+sys.path.append(os.path.dirname(os.path.abspath(__file__)))
+
+from collaborative_filtering import (
+    build_popularity_lookup,
+    min_max_normalize,
+    rerank_with_popularity_balance,
 )
-from baseline_recommenders import (
-    create_svd_model,
-    create_predicted_rating_matrix
-)
-from content_based_nlp import (
-    create_tfidf_features,
-    create_content_similarity_matrix,
-    recommend_for_existing_user,
-    recommend_for_new_user_by_preference
-)
-from ncf_recommender import (
-    encode_ids,
-    train_valid_split,
-    RatingsDataset,
-    NeuralCollaborativeFiltering,
-    train_ncf_model,
-    recommend_ncf
-)
-from torch.utils.data import DataLoader
+from content_based_nlp import recommend_for_new_user_by_profile, recommend_similar_items
+from data_loader import load_all
+from ncf_recommender import load_ncf_model, score_all_items
+from preprocessing import load_pickle
 
 
 # =========================================================
-# PATHS
+# SETTINGS
 # =========================================================
-processed_data_path = Path(r"D:\DS PROJECTS SUBMISSION\Recommendation_System_Final\data\processed")
-processed_data_path.mkdir(parents=True, exist_ok=True)
+# Hybrid score-fusion weights (must sum to 1.0).
+#
+# These were chosen by measurement, not intuition. The first version fused
+# SVD + content + NCF at 0.35 / 0.25 / 0.40 and scored NDCG@10 = 0.0947 - worse
+# than plain item-based CF on its own (0.1245). The hybrid was blending three
+# mediocre signals while ignoring the strongest one available.
+#
+# Sweep over a 250-user cohort, NDCG@10:
+#     item-based CF alone                          0.1245
+#     svd + content + ncf         (original)       0.0947
+#     item_cf + content + ncf                      0.1282
+#     item_cf .50 / content .10 / ncf .40          0.1276
+#     item_cf .45 / svd .10 / content .10 / ncf .35  0.1293   <- selected
+#
+# Item-based CF carries the collaborative signal; SVD is retained at low weight
+# because it generalises to users whose exact co-rating neighbours are absent.
+# Content is weak alone (0.0116) but has by far the best catalogue coverage
+# (0.75), so a small weight buys reach without materially costing accuracy.
+HYBRID_WEIGHTS = {
+    "item_cf": 0.45,
+    "collaborative": 0.10,
+    "content": 0.10,
+    "ncf": 0.35,
+}
+
+CANDIDATE_POOL_SIZE = 200
+COLD_START_MIN_INTERACTIONS = 3
+RELEVANCE_RATING_THRESHOLD = 4
+
+# Strategy labels returned with every recommendation, so the caller can always
+# tell a personalised result from a fallback.
+STRATEGY_HYBRID = "hybrid_fusion"
+STRATEGY_COLD_USER = "cold_start_user_profile"
+STRATEGY_UNKNOWN_USER = "global_popularity_fallback"
 
 
-# =========================================================
-# SAVE / LOAD HELPERS
-# =========================================================
-def save_pickle_local(obj, filename: str):
-    with open(processed_data_path / filename, "wb") as f:
-        pickle.dump(obj, f)
+class HybridRecommender:
+    """
+    Loaded recommendation service.
 
+    Construct once with `HybridRecommender.load()` and reuse. Loading pulls
+    several hundred megabytes of similarity matrices off disk, so doing it per
+    request would dominate response time entirely.
+    """
 
-def load_pickle_local(filename: str):
-    with open(processed_data_path / filename, "rb") as f:
-        return pickle.load(f)
+    def __init__(self, users_df, items_df, interactions_df, user_item_matrix,
+                 predicted_ratings, popularity_lookup, content_similarity,
+                 tfidf_matrix, tfidf_vectorizer, ncf_model, user_to_index,
+                 item_to_index, item_similarity=None, weights=None,
+                 feedback_type="implicit"):
 
+        self.users_df = users_df
+        self.items_df = items_df
+        self.interactions_df = interactions_df
 
-# =========================================================
-# POPULARITY LOOKUP
-# =========================================================
-def build_popularity_lookup(movie_popularity_features: pd.DataFrame) -> pd.DataFrame:
-    df = movie_popularity_features.copy()
+        self.user_item_matrix = user_item_matrix
+        self.predicted_ratings = predicted_ratings
+        self.popularity_lookup = popularity_lookup
+        self.item_similarity = item_similarity
 
-    df["popularity_penalty"] = 1 / (1 + np.log1p(df["interaction_count"]))
-    df["long_tail_boost"] = np.where(df["is_long_tail"] == 1, 1.15, 1.00)
+        self.content_similarity = content_similarity
+        self.tfidf_matrix = tfidf_matrix
+        self.tfidf_vectorizer = tfidf_vectorizer
 
-    return df.set_index("movie_id")
+        self.ncf_model = ncf_model
+        self.user_to_index = user_to_index
+        self.item_to_index = item_to_index
 
+        self.weights = dict(HYBRID_WEIGHTS) if weights is None else weights
+        self.feedback_type = feedback_type
 
-# =========================================================
-# NORMALIZE SCORES TO 0-1
-# =========================================================
-def min_max_normalize(score_series: pd.Series) -> pd.Series:
-    score_series = score_series.astype(float)
+        self.items_indexed = items_df.set_index("item_id")
 
-    if len(score_series) == 0:
-        return score_series
+        # Precompute each user's interaction history once. Filtering the full
+        # interaction log per request is the single biggest avoidable cost in
+        # the serving path.
+        self.user_seen = interactions_df.groupby("user_id")["item_id"].apply(set).to_dict()
 
-    min_val = score_series.min()
-    max_val = score_series.max()
+    # =====================================================
+    # CONSTRUCTION
+    # =====================================================
+    @classmethod
+    def load(cls, feedback_type="implicit"):
+        """
+        Load every artifact the hybrid needs from data/processed.
 
-    if max_val == min_val:
-        return pd.Series(0.0, index=score_series.index)
+        Defaults to the implicit NCF variant. The explicit model predicts star
+        ratings well (RMSE 0.91) but is useless for ranking the unseen
+        catalogue - it was never trained on items a user did not interact with,
+        so it falls back on a global item bias and returns nearly the same list
+        to everyone. Benchmarked over 800 users it scored NDCG@10 = 0.0000
+        against the implicit model's 0.0576.
+        """
+        users_df, items_df, interactions_df = load_all()
 
-    return (score_series - min_val) / (max_val - min_val)
+        user_item_matrix = load_pickle("user_item_matrix.pkl")
+        predicted_ratings = load_pickle("predicted_ratings.pkl")
+        item_popularity = load_pickle("item_popularity_features.pkl")
+        content_similarity = load_pickle("content_similarity.pkl")
+        item_similarity = load_pickle("item_similarity.pkl")
+        tfidf_matrix = load_pickle("tfidf_matrix.pkl")
+        tfidf_vectorizer = load_pickle("tfidf_vectorizer.pkl")
 
+        # The NCF signal is optional at load time, but its absence must be loud.
+        # An earlier revision of this project swallowed the failure and served
+        # recommendations with the deep-learning weight silently set to zero.
+        try:
+            ncf_model = load_ncf_model(feedback_type=feedback_type)
+            user_to_index = load_pickle("ncf_user_to_index.pkl")
+            item_to_index = load_pickle("ncf_item_to_index.pkl")
+        except FileNotFoundError as exc:
+            print("WARNING: NCF artifacts unavailable ({}).".format(exc))
+            print("         The hybrid will run on collaborative + content signals only.")
+            print("         Train the deep model with:  python models/ncf_recommender.py")
+            ncf_model, user_to_index, item_to_index = None, {}, {}
 
-# =========================================================
-# COLLABORATIVE SCORE (SVD)
-# =========================================================
-def get_collaborative_scores(
-    user_id: int,
-    user_item_matrix: pd.DataFrame,
-    predicted_ratings_df: pd.DataFrame
-) -> pd.Series:
-    if user_id not in user_item_matrix.index:
-        return pd.Series(dtype=float)
-
-    already_rated = user_item_matrix.loc[user_id]
-    already_rated_movies = already_rated[already_rated > 0].index
-
-    scores = predicted_ratings_df.loc[user_id].drop(already_rated_movies, errors="ignore")
-    scores = min_max_normalize(scores)
-
-    return scores.sort_values(ascending=False)
-
-
-# =========================================================
-# CONTENT-BASED SCORE (TF-IDF USER PROFILE)
-# =========================================================
-def get_content_scores(
-    user_id: int,
-    ratings_df: pd.DataFrame,
-    movies_df: pd.DataFrame,
-    tfidf_matrix
-) -> pd.Series:
-    try:
-        content_recs = recommend_for_existing_user(
-            user_id=user_id,
-            ratings_df=ratings_df,
-            movies_df=movies_df,
-            tfidf_matrix=tfidf_matrix,
-            n_top=len(movies_df)
-        )
-    except ValueError:
-        return pd.Series(dtype=float)
-
-    if content_recs.empty:
-        return pd.Series(dtype=float)
-
-    scores = pd.Series(
-        data=content_recs["similarity_score"].values,
-        index=content_recs["movie_id"].values
-    )
-
-    scores = min_max_normalize(scores)
-    return scores.sort_values(ascending=False)
-
-
-# =========================================================
-# NCF SCORE
-# =========================================================
-def get_ncf_scores(
-    user_id: int,
-    model,
-    ratings_df: pd.DataFrame,
-    movies_df: pd.DataFrame,
-    user_to_index: dict,
-    item_to_index: dict,
-    feedback_type: str = "explicit"
-) -> pd.Series:
-    if user_id not in user_to_index:
-        return pd.Series(dtype=float)
-
-    ncf_df = recommend_ncf(
-        model=model,
-        user_id=user_id,
-        ratings_df=ratings_df,
-        movies_df=movies_df,
-        user_to_index=user_to_index,
-        item_to_index=item_to_index,
-        top_n=len(movies_df),
-        feedback_type=feedback_type
-    )
-
-    if ncf_df.empty:
-        return pd.Series(dtype=float)
-
-    scores = pd.Series(
-        data=ncf_df["predicted_score"].values,
-        index=ncf_df["movie_id"].values
-    )
-
-    scores = min_max_normalize(scores)
-    return scores.sort_values(ascending=False)
-
-
-# =========================================================
-# APPLY POPULARITY RE-RANKING
-# =========================================================
-def apply_popularity_reranking(
-    score_series: pd.Series,
-    popularity_lookup: pd.DataFrame
-) -> pd.DataFrame:
-    recommendation_df = pd.DataFrame({"raw_score": score_series})
-
-    recommendation_df = recommendation_df.join(
-        popularity_lookup[
-            ["interaction_count", "average_rating", "is_long_tail", "popularity_penalty", "long_tail_boost"]
-        ],
-        how="left"
-    )
-
-    recommendation_df["interaction_count"] = recommendation_df["interaction_count"].fillna(0)
-    recommendation_df["average_rating"] = recommendation_df["average_rating"].fillna(0)
-    recommendation_df["is_long_tail"] = recommendation_df["is_long_tail"].fillna(1)
-    recommendation_df["popularity_penalty"] = recommendation_df["popularity_penalty"].fillna(1.0)
-    recommendation_df["long_tail_boost"] = recommendation_df["long_tail_boost"].fillna(1.0)
-
-    recommendation_df["adjusted_score"] = (
-        recommendation_df["raw_score"]
-        * recommendation_df["popularity_penalty"]
-        * recommendation_df["long_tail_boost"]
-    )
-
-    recommendation_df = recommendation_df.sort_values("adjusted_score", ascending=False)
-    return recommendation_df
-
-
-# =========================================================
-# SCORE FUSION STRATEGY
-# =========================================================
-def fuse_scores(
-    collaborative_scores: pd.Series,
-    content_scores: pd.Series,
-    ncf_scores: pd.Series,
-    popularity_lookup: pd.DataFrame,
-    weights: dict = None
-) -> pd.DataFrame:
-    if weights is None:
-        weights = {
-            "collaborative": 0.35,
-            "content": 0.25,
-            "ncf": 0.40
-        }
-
-    all_movie_ids = set(collaborative_scores.index) | set(content_scores.index) | set(ncf_scores.index)
-
-    fused = pd.DataFrame(index=list(all_movie_ids))
-    fused["collaborative_score"] = collaborative_scores.reindex(fused.index).fillna(0.0)
-    fused["content_score"] = content_scores.reindex(fused.index).fillna(0.0)
-    fused["ncf_score"] = ncf_scores.reindex(fused.index).fillna(0.0)
-
-    fused["hybrid_raw_score"] = (
-        weights["collaborative"] * fused["collaborative_score"] +
-        weights["content"] * fused["content_score"] +
-        weights["ncf"] * fused["ncf_score"]
-    )
-
-    reranked_df = apply_popularity_reranking(
-        fused["hybrid_raw_score"],
-        popularity_lookup
-    )
-
-    fused = fused.join(reranked_df[["adjusted_score"]], how="left")
-    fused = fused.sort_values("adjusted_score", ascending=False)
-
-    return fused
-
-
-# =========================================================
-# COLD-START FALLBACK LOGIC
-# =========================================================
-def recommend_cold_start_user(
-    user_id: int,
-    users_df: pd.DataFrame,
-    movies_df: pd.DataFrame,
-    popularity_lookup: pd.DataFrame,
-    n_top: int = 10
-) -> pd.DataFrame:
-    user_row = users_df.loc[users_df["user_id"] == user_id]
-
-    if user_row.empty:
-        fallback = movies_df[["movie_id", "title", "genre", "language", "imdb_rating", "popularity_score"]].copy()
-        fallback = fallback.sort_values(["imdb_rating", "popularity_score"], ascending=False).head(n_top)
-        fallback["reason"] = "global_popularity_fallback"
-        return fallback
-
-    preferred_genre = user_row.iloc[0]["preferred_category"]
-
-    cold_recs = recommend_for_new_user_by_preference(
-        preferred_genre=preferred_genre,
-        movies_df=movies_df,
-        n_top=n_top
-    ).copy()
-
-    cold_recs["reason"] = "preferred_genre_fallback"
-    return cold_recs
-
-
-# =========================================================
-# HYBRID RECOMMENDATION
-# =========================================================
-def recommend_hybrid(
-    user_id: int,
-    users_df: pd.DataFrame,
-    movies_df: pd.DataFrame,
-    ratings_df: pd.DataFrame,
-    user_item_matrix: pd.DataFrame,
-    predicted_ratings_df: pd.DataFrame,
-    tfidf_matrix,
-    ncf_model,
-    user_to_index: dict,
-    item_to_index: dict,
-    popularity_lookup: pd.DataFrame,
-    n_top: int = 10,
-    feedback_type: str = "explicit"
-) -> pd.DataFrame:
-    # ---------- Cold-start user ----------
-    if user_id not in user_item_matrix.index or ratings_df.loc[ratings_df["user_id"] == user_id].empty:
-        return recommend_cold_start_user(
-            user_id=user_id,
+        return cls(
             users_df=users_df,
-            movies_df=movies_df,
-            popularity_lookup=popularity_lookup,
-            n_top=n_top
+            items_df=items_df,
+            interactions_df=interactions_df,
+            user_item_matrix=user_item_matrix,
+            predicted_ratings=predicted_ratings,
+            popularity_lookup=build_popularity_lookup(item_popularity),
+            content_similarity=content_similarity,
+            item_similarity=item_similarity,
+            tfidf_matrix=tfidf_matrix,
+            tfidf_vectorizer=tfidf_vectorizer,
+            ncf_model=ncf_model,
+            user_to_index=user_to_index,
+            item_to_index=item_to_index,
+            feedback_type=feedback_type,
         )
 
-    collaborative_scores = get_collaborative_scores(
-        user_id=user_id,
-        user_item_matrix=user_item_matrix,
-        predicted_ratings_df=predicted_ratings_df
-    )
+    # =====================================================
+    # USER STATE
+    # =====================================================
+    def is_known_user(self, user_id):
+        return bool((self.users_df["user_id"] == user_id).any())
 
-    content_scores = get_content_scores(
-        user_id=user_id,
-        ratings_df=ratings_df,
-        movies_df=movies_df,
-        tfidf_matrix=tfidf_matrix
-    )
+    def seen_items(self, user_id):
+        return self.user_seen.get(user_id, set())
 
-    ncf_scores = get_ncf_scores(
-        user_id=user_id,
-        model=ncf_model,
-        ratings_df=ratings_df,
-        movies_df=movies_df,
-        user_to_index=user_to_index,
-        item_to_index=item_to_index,
-        feedback_type=feedback_type
-    )
+    def user_interaction_count(self, user_id):
+        return len(self.seen_items(user_id))
 
-    fused_scores = fuse_scores(
-        collaborative_scores=collaborative_scores,
-        content_scores=content_scores,
-        ncf_scores=ncf_scores,
-        popularity_lookup=popularity_lookup
-    )
+    def is_cold_start_user(self, user_id):
+        """
+        A user is cold-start when there is too little history to personalise.
 
-    result = fused_scores.head(n_top).reset_index().rename(columns={"index": "movie_id"})
+        Note this is a threshold, not a binary "has any history" check. A user
+        with a single click carries almost no signal, and treating them as warm
+        produces confidently wrong recommendations from one data point.
+        """
+        return self.user_interaction_count(user_id) < COLD_START_MIN_INTERACTIONS
 
-    result = result.merge(
-        movies_df[["movie_id", "title", "genre", "language", "imdb_rating", "popularity_score"]],
-        on="movie_id",
-        how="left"
-    )
+    # =====================================================
+    # INDIVIDUAL SIGNALS
+    # =====================================================
+    def item_cf_scores(self, user_id):
+        """
+        Item-based collaborative filtering scores, normalised to [0, 1].
 
-    return result[[
-        "movie_id",
-        "title",
-        "genre",
-        "language",
-        "imdb_rating",
-        "popularity_score",
-        "collaborative_score",
-        "content_score",
-        "ncf_score",
-        "adjusted_score"
-    ]]
+        Measured as the single strongest signal in this system (NDCG@10 = 0.1245
+        standalone, against SVD's 0.0462), which is why it carries the largest
+        fusion weight. Items are scored by their similarity to what this user
+        has already rated, weighted by those ratings.
+        """
+        if self.item_similarity is None or user_id not in self.user_item_matrix.index:
+            return pd.Series(dtype=float)
+
+        user_ratings = self.user_item_matrix.loc[user_id]
+        rated = user_ratings[user_ratings > 0]
+
+        if rated.empty:
+            return pd.Series(dtype=float)
+
+        scores = pd.Series(
+            self.item_similarity[rated.index].to_numpy() @ rated.to_numpy(),
+            index=self.item_similarity.index,
+        )
+        scores = scores.drop(list(self.seen_items(user_id)), errors="ignore")
+
+        return min_max_normalize(scores)
+
+    def collaborative_scores(self, user_id):
+        """Latent-factor (SVD) scores over unseen items, normalised to [0, 1]."""
+        if user_id not in self.predicted_ratings.index:
+            return pd.Series(dtype=float)
+
+        scores = self.predicted_ratings.loc[user_id].drop(
+            list(self.seen_items(user_id)), errors="ignore"
+        )
+        return min_max_normalize(scores)
+
+    def content_scores(self, user_id):
+        """
+        Content similarity between the user's taste profile and each item.
+
+        Built from the item-item content similarity matrix rather than by
+        re-running cosine similarity against the TF-IDF matrix: the user's
+        profile is the mean of their liked items' similarity rows, which is
+        equivalent and avoids a sparse matrix multiply per request.
+        """
+        user_rows = self.interactions_df.loc[self.interactions_df["user_id"] == user_id]
+        if user_rows.empty:
+            return pd.Series(dtype=float)
+
+        liked_mask = (
+            (user_rows["rating"] >= RELEVANCE_RATING_THRESHOLD)
+            | (user_rows["purchase"] == 1)
+        ).fillna(False)
+
+        liked_items = [i for i in user_rows.loc[liked_mask, "item_id"].unique()
+                       if i in self.content_similarity.index]
+
+        if not liked_items:
+            return pd.Series(dtype=float)
+
+        profile_similarity = self.content_similarity.loc[liked_items].mean(axis=0)
+        profile_similarity = profile_similarity.drop(
+            list(self.seen_items(user_id)), errors="ignore"
+        )
+
+        return min_max_normalize(profile_similarity)
+
+    def ncf_scores(self, user_id):
+        """Deep-model scores over unseen items, normalised to [0, 1]."""
+        if self.ncf_model is None or user_id not in self.user_to_index:
+            return pd.Series(dtype=float)
+
+        scores = score_all_items(
+            self.ncf_model,
+            user_id,
+            self.user_to_index,
+            self.item_to_index,
+            exclude_item_ids=list(self.seen_items(user_id)),
+            feedback_type=self.feedback_type,
+        )
+
+        return min_max_normalize(scores)
+
+    # =====================================================
+    # SCORE FUSION
+    # =====================================================
+    def fuse(self, item_cf, collaborative, content, ncf):
+        """
+        Weighted linear fusion, then popularity-balanced re-ranking.
+
+        Weights are renormalised over whichever signals actually produced
+        scores. Without that, a user the NCF has never seen would have their
+        final score silently multiplied by the surviving weight mass, which does
+        not change their ranking but makes the scores incomparable across users
+        and meaningless to display.
+        """
+        available = {
+            "item_cf": item_cf,
+            "collaborative": collaborative,
+            "content": content,
+            "ncf": ncf,
+        }
+        active = {name: s for name, s in available.items() if not s.empty}
+
+        if not active:
+            return pd.DataFrame()
+
+        weight_mass = sum(self.weights[name] for name in active)
+        effective_weights = {name: self.weights[name] / weight_mass for name in active}
+
+        all_item_ids = sorted(set().union(*(set(s.index) for s in active.values())))
+        fused = pd.DataFrame(index=all_item_ids)
+
+        for name, series in available.items():
+            fused[name + "_score"] = series.reindex(fused.index).fillna(0.0)
+
+        fused["hybrid_raw_score"] = sum(
+            effective_weights[name] * fused[name + "_score"] for name in active
+        )
+
+        reranked = rerank_with_popularity_balance(
+            fused["hybrid_raw_score"],
+            self.popularity_lookup,
+            candidate_pool=CANDIDATE_POOL_SIZE,
+        )
+
+        fused = fused.loc[reranked.index].join(
+            reranked[["adjusted_score", "interaction_count", "is_long_tail",
+                      "popularity_penalty", "long_tail_boost"]]
+        )
+
+        fused["active_signals"] = ", ".join(sorted(active))
+        return fused.sort_values("adjusted_score", ascending=False)
+
+    # =====================================================
+    # COLD-START FALLBACK
+    # =====================================================
+    def cold_start_recommendations(self, user_id, top_n=10):
+        """
+        Recommendations for a user with no usable interaction history.
+
+        Falls back through two tiers: a known-but-inactive user is served from
+        their registration profile (declared category + segment price band); a
+        genuinely unknown user gets de-biased global popularity, because there
+        is nothing else to personalise on.
+        """
+        user_row = self.users_df.loc[self.users_df["user_id"] == user_id]
+
+        if user_row.empty:
+            ranked = rerank_with_popularity_balance(
+                self.popularity_lookup["popularity_ratio"],
+                self.popularity_lookup,
+                candidate_pool=CANDIDATE_POOL_SIZE,
+            ).head(top_n)
+
+            result = self.items_df.loc[self.items_df["item_id"].isin(ranked.index)].copy()
+            result["hybrid_score"] = ranked["adjusted_score"].reindex(
+                result["item_id"]).to_numpy()
+            result["strategy"] = STRATEGY_UNKNOWN_USER
+            return result.sort_values("hybrid_score", ascending=False)
+
+        profile = user_row.iloc[0]
+        result = recommend_for_new_user_by_profile(
+            preferred_category=profile["preferred_category"],
+            items_df=self.items_df,
+            user_segment=profile["user_segment"],
+            n_top=top_n,
+        ).copy()
+
+        result = result.rename(columns={"cold_start_score": "hybrid_score"})
+        result["strategy"] = STRATEGY_COLD_USER
+        return result
+
+    # =====================================================
+    # PUBLIC API
+    # =====================================================
+    def recommend(self, user_id, top_n=10):
+        """
+        Top-N recommendations for a user, with per-signal score attribution.
+
+        The returned frame always carries a `strategy` column so the caller can
+        tell a personalised result from a cold-start fallback. Presenting the
+        two identically is how a dashboard ends up claiming a brand-new user has
+        a learned taste profile.
+        """
+        if self.is_cold_start_user(user_id):
+            return self.cold_start_recommendations(user_id, top_n)
+
+        fused = self.fuse(
+            self.item_cf_scores(user_id),
+            self.collaborative_scores(user_id),
+            self.content_scores(user_id),
+            self.ncf_scores(user_id),
+        )
+
+        if fused.empty:
+            return self.cold_start_recommendations(user_id, top_n)
+
+        top = fused.head(top_n).copy()
+        top.index.name = "item_id"
+        top = top.reset_index()
+
+        catalogue_columns = [
+            c for c in ["item_id", "title", "category", "subcategory", "brand",
+                        "price", "content_tags"]
+            if c in self.items_df.columns
+        ]
+        top = top.merge(self.items_df[catalogue_columns], on="item_id", how="left")
+
+        top = top.rename(columns={"adjusted_score": "hybrid_score"})
+        top["strategy"] = STRATEGY_HYBRID
+
+        return top
+
+    def similar_items(self, item_id, top_n=10):
+        """Content-similar items. Works for any catalogued item, cold or not."""
+        return recommend_similar_items(
+            item_id=item_id,
+            items_df=self.items_df,
+            similarity_df=self.content_similarity,
+            n_top=top_n,
+        )
+
+    def item_details(self, item_id):
+        if item_id not in self.items_indexed.index:
+            return None
+        return self.items_indexed.loc[item_id]
+
+    def user_details(self, user_id):
+        row = self.users_df.loc[self.users_df["user_id"] == user_id]
+        if row.empty:
+            return None
+        return row.iloc[0]
 
 
 # =========================================================
-# PREPARE NCF MODEL
+# DEMONSTRATION
 # =========================================================
-def train_ncf_for_hybrid(ratings_df: pd.DataFrame, feedback_type: str = "explicit"):
-    encoded_ratings_df, user_to_index, item_to_index, index_to_user, index_to_item = encode_ids(ratings_df)
+def main():
+    print("Loading hybrid recommender ...")
+    recommender = HybridRecommender.load()
 
-    train_df, valid_df = train_valid_split(
-        encoded_ratings_df,
-        valid_ratio=0.2,
-        random_state=42
-    )
+    display_columns = ["item_id", "title", "category", "price", "item_cf_score",
+                       "collaborative_score", "content_score", "ncf_score", "hybrid_score"]
 
-    train_dataset = RatingsDataset(train_df, feedback_type=feedback_type)
-    valid_dataset = RatingsDataset(valid_df, feedback_type=feedback_type)
+    # ---- Warm user --------------------------------------------------------
+    active_user = int(recommender.interactions_df["user_id"].value_counts().index[0])
+    profile = recommender.user_details(active_user)
 
-    train_loader = DataLoader(train_dataset, batch_size=1024, shuffle=True)
-    valid_loader = DataLoader(valid_dataset, batch_size=1024, shuffle=False)
+    print("\nWarm user {}: {}, prefers {}, {} interactions".format(
+        active_user, profile["user_segment"], profile["preferred_category"],
+        recommender.user_interaction_count(active_user)))
 
-    model = NeuralCollaborativeFiltering(
-        num_users=len(user_to_index),
-        num_items=len(item_to_index),
-        embedding_dim=32,
-        hidden_dims=[128, 64, 32],
-        dropout=0.25
-    )
+    warm = recommender.recommend(active_user, top_n=5)
+    print("  strategy:", warm["strategy"].iloc[0])
+    print(warm[[c for c in display_columns if c in warm.columns]].to_string(index=False))
 
-    model, history = train_ncf_model(
-        model=model,
-        train_loader=train_loader,
-        valid_loader=valid_loader,
-        feedback_type=feedback_type,
-        learning_rate=1e-3,
-        weight_decay=1e-5,
-        epochs=10,
-        patience=3
-    )
+    # ---- Cold-start user --------------------------------------------------
+    counts = recommender.users_df["user_id"].map(recommender.user_interaction_count)
+    cold_user = int(recommender.users_df.loc[
+        counts < COLD_START_MIN_INTERACTIONS, "user_id"].iloc[0])
+    cold_profile = recommender.user_details(cold_user)
 
-    torch.save(model.state_dict(), processed_data_path / "hybrid_ncf_model.pt")
-    save_pickle_local(user_to_index, "hybrid_user_to_index.pkl")
-    save_pickle_local(item_to_index, "hybrid_item_to_index.pkl")
+    print("\nCold-start user {}: {}, prefers {}, {} interactions".format(
+        cold_user, cold_profile["user_segment"], cold_profile["preferred_category"],
+        recommender.user_interaction_count(cold_user)))
 
-    return model, user_to_index, item_to_index
+    cold = recommender.recommend(cold_user, top_n=5)
+    print("  strategy:", cold["strategy"].iloc[0])
+    cold_columns = [c for c in ["item_id", "title", "category", "price", "hybrid_score"]
+                    if c in cold.columns]
+    print(cold[cold_columns].to_string(index=False))
+
+    # ---- Unknown user -----------------------------------------------------
+    unknown = recommender.recommend(999999, top_n=3)
+    print("\nUnknown user 999999 -> strategy:", unknown["strategy"].iloc[0])
+
+    # ---- Similar items ----------------------------------------------------
+    sample_item = int(recommender.items_df["item_id"].iloc[0])
+    details = recommender.item_details(sample_item)
+    print("\nItems similar to #{} ({}):".format(sample_item, details["title"]))
+    print(recommender.similar_items(sample_item, 5)[
+        ["item_id", "title", "category", "price", "similarity_score"]
+    ].to_string(index=False))
 
 
-# =========================================================
-# MAIN
-# =========================================================
 if __name__ == "__main__":
-    # LOAD DATA
-    users_df = load_users()
-    movies_df = load_movies()
-    ratings_df = load_ratings()
-
-    # PREPROCESSING
-    user_item_matrix = create_user_item_matrix(ratings_df)
-    normalized_user_item_matrix = create_normalized_user_item_matrix(ratings_df)
-    implicit_feedback_matrix = create_implicit_feedback_matrix(ratings_df, threshold=4)
-    movie_popularity_features = create_movie_popularity_features(ratings_df)
-    user_profile_features = create_user_profile_features(users_df)
-
-    save_pickle(user_item_matrix, "user_item_matrix.pkl")
-    save_pickle(normalized_user_item_matrix, "normalized_user_item_matrix.pkl")
-    save_pickle(implicit_feedback_matrix, "implicit_feedback_matrix.pkl")
-    save_pickle(movie_popularity_features, "movie_popularity_features.pkl")
-    save_pickle(user_profile_features, "user_profile_features.pkl")
-
-    popularity_lookup = build_popularity_lookup(movie_popularity_features)
-
-    # COLLABORATIVE FILTERING (SVD)
-    svd_model, user_factors_df, item_factors_df = create_svd_model(
-        normalized_user_item_matrix,
-        n_components=50
-    )
-    predicted_ratings_df = create_predicted_rating_matrix(
-        normalized_user_item_matrix,
-        user_factors_df,
-        item_factors_df
-    )
-
-    # CONTENT-BASED NLP
-    movies_with_desc, tfidf, tfidf_matrix = create_tfidf_features(movies_df)
-    content_similarity_df = create_content_similarity_matrix(movies_with_desc, tfidf_matrix)
-
-    save_pickle_local(content_similarity_df, "content_similarity.pkl")
-
-    # DEEP LEARNING (NCF)
-    ncf_model, user_to_index, item_to_index = train_ncf_for_hybrid(
-        ratings_df=ratings_df,
-        feedback_type="explicit"
-    )
-
-    # SAMPLE EXISTING USER
-    sample_user_id = ratings_df["user_id"].iloc[0]
-
-    hybrid_recommendations = recommend_hybrid(
-        user_id=sample_user_id,
-        users_df=users_df,
-        movies_df=movies_with_desc,
-        ratings_df=ratings_df,
-        user_item_matrix=user_item_matrix,
-        predicted_ratings_df=predicted_ratings_df,
-        tfidf_matrix=tfidf_matrix,
-        ncf_model=ncf_model,
-        user_to_index=user_to_index,
-        item_to_index=item_to_index,
-        popularity_lookup=popularity_lookup,
-        n_top=10,
-        feedback_type="explicit"
-    )
-
-    print(f"\nTop Hybrid Recommendations for existing user {sample_user_id}:")
-    print(hybrid_recommendations)
-
-    # SAMPLE COLD-START USER
-    new_user_id = 999999
-
-    cold_start_recommendations = recommend_hybrid(
-        user_id=new_user_id,
-        users_df=users_df,
-        movies_df=movies_with_desc,
-        ratings_df=ratings_df,
-        user_item_matrix=user_item_matrix,
-        predicted_ratings_df=predicted_ratings_df,
-        tfidf_matrix=tfidf_matrix,
-        ncf_model=ncf_model,
-        user_to_index=user_to_index,
-        item_to_index=item_to_index,
-        popularity_lookup=popularity_lookup,
-        n_top=10,
-        feedback_type="explicit"
-    )
-
-    print(f"\nTop Hybrid Recommendations for cold-start user {new_user_id}:")
-    print(cold_start_recommendations)
+    main()

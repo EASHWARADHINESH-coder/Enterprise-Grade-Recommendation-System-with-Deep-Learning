@@ -1,5 +1,0 @@
-Model,Feedback_Type,Train_Time_Seconds,Inference_Time_100_Users_Seconds,MSE,RMSE,MAE,Accuracy
-Classical CF (SVD),Explicit,1.6463,1.1164,6.6298,2.5748,2.3303,
-Classical CF (Implicit Item-Item),Implicit,2.018,0.3226,,,,
-NCF,Explicit,37.8375,3.7423,1.3254,1.1513,0.904,
-NCF,Implicit,34.9779,1.4835,,,,0.8736
