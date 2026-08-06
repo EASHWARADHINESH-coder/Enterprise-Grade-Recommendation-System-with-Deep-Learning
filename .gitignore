@@ -59,5 +59,6 @@ Thumbs.db
 outputs_tmp/
 *.log
 
-# Claude Code / editor tooling
-.claude/
+# Editor / IDE tooling
+.vscode/
+.idea/
