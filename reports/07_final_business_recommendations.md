@@ -13,7 +13,7 @@ pipeline on engineered synthetic data — 6,000 customers, a 2,500-product
 catalogue, 138,345 interactions — and benchmarked six recommendation approaches
 under a leak-free time-based split.
 
-**The hybrid model is the best performer: NDCG@10 of 0.1095, a 69.8% lift over
+**The hybrid model is the best performer: NDCG@10 of 0.1095, a 69.9% lift over
 the popularity baseline.**
 
 Three findings matter more than that headline number:

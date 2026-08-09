@@ -57,7 +57,7 @@ break naive approaches:
 | SVD | 0.0462 | 9.6% |
 | Content (TF-IDF) | 0.0116 | 75.4% |
 
-**The hybrid is best on every ranking metric — +69.8% over the popularity
+**The hybrid is best on every ranking metric — +69.9% over the popularity
 baseline**, measured on a time-based split with no interaction leakage.
 
 ---
@@ -573,7 +573,7 @@ to a served, explainable API.
 
 **What the evidence supports:**
 
-- The **hybrid is the best model**, at NDCG@10 = 0.1095 and **+69.8% over the
+- The **hybrid is the best model**, at NDCG@10 = 0.1095 and **+69.9% over the
   popularity baseline**, measured with a time-based split and leakage assertions.
 - Fusing signals genuinely helps. The hybrid beats its strongest single component
   (0.1095 vs 0.1044) because each signal covers the others' blind spots.

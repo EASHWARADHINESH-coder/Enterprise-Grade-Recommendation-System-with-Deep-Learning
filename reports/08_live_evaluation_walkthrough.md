@@ -21,7 +21,7 @@ the questions an evaluator is most likely to ask.
 >
 > I built four baselines, a TF-IDF content recommender, a PyTorch NCF model, and
 > a hybrid that fuses them. I benchmarked all six on a time-based split with
-> no-leakage assertions. The hybrid won at NDCG@10 = 0.1095, 69.8% above the
+> no-leakage assertions. The hybrid won at NDCG@10 = 0.1095, 69.9% above the
 > popularity baseline.
 >
 > The most interesting part wasn't the winning number. The benchmark caught two
@@ -347,7 +347,7 @@ customer has a learned taste profile.
 Absolute ranking metrics on sparse implicit data are always low — a customer has
 ~4.4 relevant items in the test period out of a 2,500-item catalogue, so
 Precision@10 is capped around 0.44 even for a perfect model. What matters is the
-**relative** comparison on identical data and splits: the hybrid is 69.8% above
+**relative** comparison on identical data and splits: the hybrid is 69.9% above
 the popularity baseline.
 
 ### "This is all made-up data. What does it prove?"
@@ -388,7 +388,7 @@ directly poisons the popularity model and the item-item similarity matrix.
 | Item-CF NDCG@10 | 0.1044 |
 | NCF NDCG@10 | 0.0663 |
 | Popularity NDCG@10 | 0.0645 |
-| **Lift over baseline** | **+69.8%** |
+| **Lift over baseline** | **+69.9%** |
 | NCF RMSE (explicit) | 0.9108 |
 | NCF accuracy (implicit) | 0.8583 |
 | NCF parameters | 278,817 |

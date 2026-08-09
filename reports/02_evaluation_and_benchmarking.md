@@ -75,7 +75,7 @@ Mean relevant items per evaluated customer: **4.4**.
 | Content (TF-IDF) | 0.0073 | 0.0161 | 0.0049 | 0.0116 | 0.0675 |
 
 **Headline: the Hybrid is the best model on every ranking metric, at
-+69.8% NDCG@10 over the popularity baseline.**
++69.9% NDCG@10 over the popularity baseline.**
 
 ### K = 5 and K = 20
 
