@@ -1,35 +1,4 @@
-"""
-Synthetic Data Generation  (CRITICAL PHASE)
-===========================================
-Enterprise-Grade Recommendation System with Deep Learning
-Domain: E-Commerce / Retail
-
-Generates the three mandated tables:
-
-    users.csv         user_id, age, gender, location, user_segment, ...
-    items.csv         item_id, category, title, description, price, content_tags, ...
-    interactions.csv  user_id, item_id, click, view_time_seconds, add_to_cart,
-                      purchase, rating, timestamp, ...
-
-The point of this module is NOT simply to emit random rows. A recommender
-trained on uniformly random data learns nothing, and an EDA run over uniformly
-random data cannot demonstrate the properties the business case asks for.
-
-So the generator deliberately engineers five real-world properties:
-
-  1. POPULARITY BIAS   item exposure follows a Zipf power law, so a small head
-                       of items absorbs most of the demand.
-  2. LONG TAIL         the majority of the catalogue receives few interactions.
-  3. SPARSITY          the user-item matrix is >98% empty, as on a real platform.
-  4. COLD START        a reserved slice of users and of newly launched items is
-                       held at near-zero interaction volume.
-  5. LATENT STRUCTURE  choices are driven by category affinity AND by segment
-                       price sensitivity, giving the models two genuine latent
-                       factors to recover rather than pure noise.
-
-Run:
-    python synthetic_data/generate_synthetic_data.py
-"""
+"""Synthetic Data Generation - creates the e-commerce dataset."""
 
 import os
 from datetime import timedelta
@@ -41,8 +10,6 @@ from faker import Faker
 
 # =========================================================
 # PATHS
-# Computed relative to this file, so the project runs from any
-# folder or drive without editing a hardcoded path.
 # =========================================================
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 RAW_DATA_PATH = os.path.join(BASE_DIR, "data", "raw")
@@ -67,10 +34,7 @@ REFERENCE_DATE = pd.Timestamp("2026-06-30")
 
 
 # =========================================================
-# DATA VOLUME
-# Spec minimums: 5,000 users / 2,000 items / 100,000+ interactions.
-# We generate above the floor so that after the deliberate cold-start
-# carve-outs we still clear every minimum comfortably.
+# DATA VOLUME  (spec minimums: 5,000 / 2,000 / 100,000)
 # =========================================================
 NUM_USERS = 6000
 NUM_ITEMS = 2500
@@ -79,19 +43,11 @@ NUM_INTERACTIONS = 150000
 
 # =========================================================
 # REALISM CONTROLS
-# These are the knobs that turn a flat random dataset into one that
-# behaves like a real catalogue. Each is analysed in the EDA notebook.
 # =========================================================
 
-# Item popularity follows a shifted power law:
-#     exposure(rank) = 1 / (rank + ZIPF_RANK_OFFSET) ** ZIPF_ALPHA
-#
-# The offset matters. With a pure 1/rank**alpha law the head is so steep that
-# the top item's expected exposure exceeds the entire user base; because a user
-# can only interact with an item once, the head saturates at "every user saw
-# it" and those items stop carrying any discriminative signal. The offset
-# flattens the very top while leaving the tail untouched, which reproduces the
-# Pareto shape without the saturation artefact.
+# Shifted power law: exposure(rank) = 1 / (rank + offset) ** alpha.
+# The offset stops the head saturating - with a pure 1/rank law the top
+# item's exposure exceeds the user base and it loses all signal.
 ZIPF_ALPHA = 1.25
 ZIPF_RANK_OFFSET = 25
 
@@ -115,9 +71,8 @@ PRICE_AFFINITY_STRENGTH = 0.55
 # Buyers rate far more often than browsers, so effective coverage lands higher.
 RATING_COVERAGE = 0.65
 
-# Rating generation. Real marketplace ratings are J-shaped: the mean sits near
-# 4 and 5-star reviews dominate. A symmetric distribution centred on 3 is the
-# classic tell-tale of synthetic data, so these are tuned to reproduce the skew.
+# Tuned so ratings are J-shaped (mean ~3.9, skewed high). A symmetric
+# distribution centred on 3 is the classic tell-tale of synthetic data.
 RATING_INTERCEPT = 2.35
 RATING_SLOPE = 3.15
 RATING_NOISE_SD = 0.60
@@ -129,9 +84,7 @@ RECENCY_BIAS = 1.6          # >1 concentrates interactions toward recent dates
 
 # =========================================================
 # E-COMMERCE CATALOGUE TAXONOMY
-# category -> subcategories, brands, price band, tag pool
-# Price bands differ per category so that price becomes a genuine latent
-# signal the models can learn, not noise.
+# Price bands differ per category so price is a real latent signal.
 # =========================================================
 CATALOGUE = {
     "Electronics": {
@@ -301,9 +254,6 @@ CATEGORIES = list(CATALOGUE.keys())
 
 # =========================================================
 # USER SEGMENTS
-# price_percentile    = centre of the price band this segment gravitates to
-# purchase_propensity = how readily browsing converts to a purchase
-# rating_bias         = systematic optimism/pessimism when rating
 # =========================================================
 USER_SEGMENTS = {
     "Budget Shopper": {
@@ -342,13 +292,7 @@ LOCATIONS = [
 # 1. USERS
 # =========================================================
 def generate_users(num_users=NUM_USERS):
-    """
-    Build the users table.
-
-    `user_segment` is the commercially meaningful field: it determines which
-    price band a user gravitates to, how readily they convert, and how
-    generously they rate. It is what turns "a user" into "a kind of shopper".
-    """
+    """Build the users table."""
     segment_names = list(USER_SEGMENTS.keys())
     segment_shares = np.array([USER_SEGMENTS[s]["share"] for s in segment_names])
     segment_shares = segment_shares / segment_shares.sum()
@@ -414,20 +358,7 @@ AUDIENCES = [
 
 
 def generate_items(num_items=NUM_ITEMS):
-    """
-    Build the items table.
-
-    Two fields carry most of the weight downstream:
-
-      * `description`  - free text, consumed directly by the TF-IDF content
-                         recommender. Written so that items in the same
-                         subcategory share vocabulary while items across
-                         categories do not, which is what makes cosine
-                         similarity meaningful rather than arbitrary.
-      * `price`        - drawn from a per-category log-normal inside that
-                         category's band, so price distributions differ by
-                         category exactly as in a real catalogue.
-    """
+    """Build the items table."""
     records = []
 
     # Uneven distribution across categories, since real catalogues are not
@@ -521,13 +452,7 @@ def generate_items(num_items=NUM_ITEMS):
 # 3. INTERACTIONS
 # =========================================================
 def draw_user_activity(num_users, target_interactions):
-    """
-    Draw per-user interaction counts from a log-normal distribution.
-
-    Real platforms have a small cohort of power users and a very large cohort
-    of near-dormant users. A uniform count per user would erase that structure
-    and make every user equally easy to model.
-    """
+    """Draw per-user interaction counts from a log-normal distribution."""
     raw = rng.lognormal(USER_ACTIVITY_LOG_MEAN, USER_ACTIVITY_LOG_SIGMA, size=num_users)
     counts = np.clip(
         np.round(raw),
@@ -547,28 +472,13 @@ def draw_user_activity(num_users, target_interactions):
 
 
 def weighted_sample_without_replacement(log_weights, k):
-    """
-    Gumbel top-k trick.
-
-    Adding Gumbel noise to log-weights and taking the top k is mathematically
-    equivalent to sequential weighted sampling without replacement, but runs as
-    a single vectorised operation. This is what keeps generation of 138k
-    interactions to a few seconds instead of several minutes.
-    """
+    """Gumbel top-k trick."""
     keys = log_weights + rng.gumbel(size=log_weights.shape[0])
     return np.argpartition(-keys, k - 1)[:k]
 
 
 def generate_interactions(users_df, items_df, target_interactions=NUM_INTERACTIONS):
-    """
-    Build the interactions table as a realistic e-commerce engagement funnel.
-
-    Every row is at minimum a click (a product-page view). From there the row
-    may progress to add-to-cart, then to purchase, and may or may not receive an
-    explicit star rating. This mirrors how commerce data actually arrives and
-    gives the project both an implicit signal (purchase / cart) and an explicit
-    signal (rating) drawn from the same underlying preference.
-    """
+    """Build the interactions table as a realistic e-commerce engagement funnel."""
     num_users = len(users_df)
     num_items = len(items_df)
 

@@ -1,26 +1,4 @@
-"""
-Baseline Recommendation Models (Machine Learning)
-=================================================
-Enterprise-Grade Recommendation System with Deep Learning
-
-The four baselines the business case marks as mandatory:
-
-    1. Popularity-based recommender
-    2. User-based Collaborative Filtering
-    3. Item-based Collaborative Filtering
-    4. Matrix Factorisation (Truncated SVD)
-
-These exist to establish the bar. A deep model that cannot beat a popularity
-list is not worth its serving cost, and stating that comparison honestly is the
-point of building them first.
-
-Implemented with scikit-learn. The `surprise` library named as an alternative
-in the brief has no wheel for Python 3.13, so TruncatedSVD provides the matrix
-factorisation instead - the same latent-factor method, without the dependency.
-
-Run:
-    python models/baseline_recommenders.py
-"""
+"""Baseline Recommendation Models - popularity, user-CF, item-CF, SVD."""
 
 import os
 import sys
@@ -30,7 +8,6 @@ import pandas as pd
 from sklearn.decomposition import TruncatedSVD
 from sklearn.metrics.pairwise import cosine_similarity
 
-# Make the shared modules in src/ importable from this folder.
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.append(os.path.join(BASE_DIR, "src"))
 
@@ -54,15 +31,8 @@ DEFAULT_NEIGHBOURS = 50
 # =========================================================
 # 1. POPULARITY-BASED RECOMMENDER
 # =========================================================
-def build_popularity_model(interactions_df):
-    """
-    Rank the catalogue by a blended popularity score.
-
-    Raw interaction count alone rewards items that are merely widely exposed.
-    Blending in average rating and conversion rate means an item has to be both
-    seen and actually liked to reach the top of the list, which is the sensible
-    non-personalised default for a storefront.
-    """
+def build_popularity_model(interactions_df: pd.DataFrame) -> pd.DataFrame:
+    """Rank the catalogue by a blended popularity score."""
     popularity_df = interactions_df.groupby("item_id").agg(
         interaction_count=("item_id", "count"),
         avg_rating=("rating", "mean"),
@@ -75,13 +45,14 @@ def build_popularity_model(interactions_df):
         popularity_df["purchase_count"] / popularity_df["interaction_count"]
     )
 
-    # Scale each component to [0, 1] so the weights mean what they say.
-    def scale(series):
+    def scale(series: pd.Series) -> pd.Series:
         lo, hi = series.min(), series.max()
         if hi > lo:
             return (series - lo) / (hi - lo)
         return pd.Series(0.0, index=series.index)
 
+    # Scale each component so the weights mean what they say; unscaled,
+    # interaction count would swamp average rating regardless of weight.
     popularity_df["popularity_score"] = (
         0.50 * scale(popularity_df["interaction_count"])
         + 0.30 * scale(popularity_df["avg_rating"])
@@ -96,8 +67,9 @@ def build_popularity_model(interactions_df):
     return popularity_df
 
 
-def recommend_popular(user_id, interactions_df, popularity_df, n_top=10):
-    """Top-N most popular items the user has not already interacted with."""
+def recommend_popular(user_id: int, interactions_df: pd.DataFrame,
+                      popularity_df: pd.DataFrame, n_top: int = 10) -> list:
+    """Top-N most popular items the user has not seen."""
     seen = interactions_df.loc[interactions_df["user_id"] == user_id, "item_id"].tolist()
 
     return (
@@ -110,16 +82,9 @@ def recommend_popular(user_id, interactions_df, popularity_df, n_top=10):
 # =========================================================
 # 2. USER-BASED COLLABORATIVE FILTERING
 # =========================================================
-def create_user_similarity_matrix(user_item_matrix):
-    """
-    Cosine similarity between every pair of users.
-
-    Note the cost: this is an O(users^2) dense matrix. At ~5,800 users it is
-    ~133 MB in float32 and still tractable, but it is the first thing that
-    breaks as the platform grows - which is why the scalability document
-    recommends replacing it with approximate nearest neighbours beyond ~50k
-    users rather than scaling the machine.
-    """
+def create_user_similarity_matrix(user_item_matrix: pd.DataFrame) -> pd.DataFrame:
+    """Cosine similarity between every pair of users."""
+    # O(users^2): 133 MB here, 40 GB at 100k users. First thing to break at scale.
     similarity = cosine_similarity(user_item_matrix).astype(np.float32)
 
     user_similarity_df = pd.DataFrame(
@@ -132,18 +97,15 @@ def create_user_similarity_matrix(user_item_matrix):
     return user_similarity_df
 
 
-def recommend_user_based(user_id, user_item_matrix, user_similarity_df,
-                         n_top=10, n_neighbours=DEFAULT_NEIGHBOURS):
-    """
-    Score items by what similar users rated highly.
-
-    Only the top `n_neighbours` most similar users contribute. Using all users
-    would drown the signal in near-zero similarities and quietly collapse the
-    output toward a popularity ranking.
-    """
+def recommend_user_based(user_id: int, user_item_matrix: pd.DataFrame,
+                         user_similarity_df: pd.DataFrame, n_top: int = 10,
+                         n_neighbours: int = DEFAULT_NEIGHBOURS) -> list:
+    """Score items by what the most similar users rated highly."""
     if user_id not in user_item_matrix.index:
         raise ValueError("user_id " + str(user_id) + " not present in the rating matrix.")
 
+    # Top-N neighbours only: all users would drown the signal in near-zero
+    # similarities and collapse the output toward popularity.
     similar_users = (
         user_similarity_df.loc[user_id]
         .drop(user_id, errors="ignore")
@@ -168,14 +130,8 @@ def recommend_user_based(user_id, user_item_matrix, user_similarity_df,
 # =========================================================
 # 3. ITEM-BASED COLLABORATIVE FILTERING
 # =========================================================
-def create_item_similarity_matrix(user_item_matrix):
-    """
-    Cosine similarity between every pair of items.
-
-    Preferred over the user-user matrix in production: the catalogue changes far
-    more slowly than the user base, so this can be recomputed nightly instead of
-    continuously.
-    """
+def create_item_similarity_matrix(user_item_matrix: pd.DataFrame) -> pd.DataFrame:
+    """Cosine similarity between every pair of items."""
     item_similarity = cosine_similarity(user_item_matrix.T).astype(np.float32)
 
     item_similarity_df = pd.DataFrame(
@@ -188,8 +144,9 @@ def create_item_similarity_matrix(user_item_matrix):
     return item_similarity_df
 
 
-def recommend_item_based(user_id, user_item_matrix, item_similarity_df, n_top=10):
-    """Score candidates by similarity to the items this user already rated."""
+def recommend_item_based(user_id: int, user_item_matrix: pd.DataFrame,
+                         item_similarity_df: pd.DataFrame, n_top: int = 10) -> list:
+    """Score candidates by similarity to the items this user rated."""
     if user_id not in user_item_matrix.index:
         raise ValueError("user_id " + str(user_id) + " not present in the rating matrix.")
 
@@ -199,7 +156,6 @@ def recommend_item_based(user_id, user_item_matrix, item_similarity_df, n_top=10
     if rated_items.empty:
         return []
 
-    # Vectorised: weight each rated item's similarity column by its rating.
     scores = item_similarity_df[rated_items.index].to_numpy() @ rated_items.to_numpy()
     scores = pd.Series(scores, index=item_similarity_df.index)
 
@@ -210,14 +166,8 @@ def recommend_item_based(user_id, user_item_matrix, item_similarity_df, n_top=10
 # =========================================================
 # 4. MATRIX FACTORISATION (TRUNCATED SVD)
 # =========================================================
-def create_svd_model(user_item_matrix, n_components=SVD_COMPONENTS):
-    """
-    Factorise the rating matrix into latent user and item factors.
-
-    The matrix is >99% empty, so the raw co-occurrence signal is far too thin
-    for direct similarity. Compressing to `n_components` latent dimensions lets
-    the model generalise across users who liked related-but-not-identical items.
-    """
+def create_svd_model(user_item_matrix: pd.DataFrame, n_components: int = SVD_COMPONENTS):
+    """Factorise the rating matrix into latent user and item factors."""
     svd = TruncatedSVD(n_components=n_components, random_state=42)
 
     user_factors = svd.fit_transform(user_item_matrix)
@@ -236,7 +186,9 @@ def create_svd_model(user_item_matrix, n_components=SVD_COMPONENTS):
     return svd, user_factors_df, item_factors_df
 
 
-def create_predicted_rating_matrix(user_item_matrix, user_factors_df, item_factors_df):
+def create_predicted_rating_matrix(user_item_matrix: pd.DataFrame,
+                                   user_factors_df: pd.DataFrame,
+                                   item_factors_df: pd.DataFrame) -> pd.DataFrame:
     """Reconstruct the dense score matrix from the latent factors."""
     predicted = user_factors_df.to_numpy() @ item_factors_df.to_numpy().T
 
@@ -250,7 +202,8 @@ def create_predicted_rating_matrix(user_item_matrix, user_factors_df, item_facto
     return predicted_df
 
 
-def recommend_svd(user_id, user_item_matrix, predicted_ratings_df, n_top=10):
+def recommend_svd(user_id: int, user_item_matrix: pd.DataFrame,
+                  predicted_ratings_df: pd.DataFrame, n_top: int = 10) -> list:
     """Top-N unseen items by reconstructed latent score."""
     if user_id not in user_item_matrix.index:
         raise ValueError("user_id " + str(user_id) + " not present in the rating matrix.")
@@ -266,8 +219,8 @@ def recommend_svd(user_id, user_item_matrix, predicted_ratings_df, n_top=10):
 # =========================================================
 # PRESENTATION HELPER
 # =========================================================
-def describe_items(item_ids, items_df):
-    """Map a ranked list of item_ids back to human-readable catalogue rows."""
+def describe_items(item_ids: list, items_df: pd.DataFrame) -> pd.DataFrame:
+    """Map a ranked list of item_ids back to catalogue rows."""
     columns = [c for c in ["item_id", "title", "category", "brand", "price"]
                if c in items_df.columns]
 
@@ -277,9 +230,10 @@ def describe_items(item_ids, items_df):
 
 
 # =========================================================
-# PIPELINE ENTRY POINT
+# MAIN
 # =========================================================
-def main():
+def main() -> None:
+    """Train all four baselines and compare them on one user."""
     users_df, items_df, interactions_df = load_all()
     user_item_matrix = load_pickle("user_item_matrix.pkl")
     normalized_matrix = load_pickle("normalized_user_item_matrix.pkl")
@@ -295,21 +249,18 @@ def main():
     item_similarity_df = create_item_similarity_matrix(user_item_matrix)
     print("  item similarity   :", item_similarity_df.shape)
 
-    # SVD runs on the mean-centred matrix so latent factors capture relative
-    # preference rather than each user's personal rating offset.
+    # SVD on the mean-centred matrix so factors capture relative preference.
     svd, user_factors_df, item_factors_df = create_svd_model(normalized_matrix)
     predicted_ratings_df = create_predicted_rating_matrix(
         normalized_matrix, user_factors_df, item_factors_df
     )
     print("  predicted ratings :", predicted_ratings_df.shape)
 
-    # ---- Demonstrate all four on the same user --------------------------
     sample_user_id = int(user_item_matrix.index[0])
     user_row = users_df.loc[users_df["user_id"] == sample_user_id].iloc[0]
 
-    print("\nSample recommendations for user_id {}".format(sample_user_id))
-    print("  segment={}, prefers={}\n".format(
-        user_row["user_segment"], user_row["preferred_category"]))
+    print("\nUser {} - {}, prefers {}\n".format(
+        sample_user_id, user_row["user_segment"], user_row["preferred_category"]))
 
     results = [
         ("Popularity", recommend_popular(sample_user_id, interactions_df, popularity_df, 5)),

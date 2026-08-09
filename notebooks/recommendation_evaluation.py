@@ -1,31 +1,4 @@
-"""
-Recommendation Evaluation (CRITICAL)
-====================================
-Enterprise-Grade Recommendation System with Deep Learning
-
-Benchmarks every model on the same users, the same split, and the same metrics.
-
-The two constraints the business case imposes are both structural, and both are
-enforced here rather than assumed:
-
-  TIME-BASED SPLIT     the final 90 days are held out. Training happens only on
-                       what came before.
-  NO INTERACTION LEAK  no model may see any test-period interaction, and the
-                       candidate set excludes everything the user touched during
-                       training. Without that second rule a model scores points
-                       for "predicting" purchases it was shown.
-
-Models compared:
-    Popularity            non-personalised baseline
-    Item-based CF         classical collaborative filtering
-    SVD                   matrix factorisation
-    Content (TF-IDF)      NLP-based
-    NCF                   deep learning
-    Hybrid                score fusion of the above
-
-Run:
-    python notebooks/recommendation_evaluation.py
-"""
+"""Recommendation Evaluation - benchmarks every model on a leak-free time-based split."""
 
 import os
 import sys
@@ -74,30 +47,13 @@ TOP_N = max(K_VALUES)
 TEST_PERIOD_DAYS = 90
 RELEVANCE_RATING_THRESHOLD = 4
 
-# Cap the evaluation cohort. Scoring the full catalogue for every one of ~5,800
-# users across six models is slow and adds nothing: the metric standard errors
-# are already small at this sample size.
+# Cap the cohort: standard errors are already small at this size.
 MAX_EVAL_USERS = 800
 RANDOM_SEED = 42
 
-# Which NCF variant to rank with. This must be the implicit model, and the
-# reason is the single most important modelling lesson in this project.
-#
-# The explicit model minimises MSE against observed star ratings. It is a good
-# rating predictor (RMSE 0.91) but it has never once been shown an item a user
-# did not interact with, so scoring the unseen catalogue is entirely out of
-# distribution. What it falls back on is the global item bias, which is the
-# same for everybody - measured here, it returned the same ~14 items to every
-# user (catalogue coverage 0.006) and scored NDCG@10 = 0.0000.
-#
-# The implicit model is trained with sampled negatives drawn from the catalogue
-# the user never touched, so discriminating "would engage" from "would not" IS
-# its training objective. Same architecture, same data, same 800-user cohort:
-#
-#     explicit  NDCG@10 = 0.0000   coverage 0.006
-#     implicit  NDCG@10 = 0.0576   coverage 0.013
-#
-# Accuracy on a rating-prediction metric says nothing about ranking quality.
+# Must be the implicit model. The explicit one predicts ratings well
+# (RMSE 0.91) but scored NDCG@10 = 0.0000 with coverage 0.006 - it was
+# never shown un-interacted items, so ranking them is out of distribution.
 NCF_RANKING_MODE = "implicit"
 
 
@@ -105,17 +61,7 @@ NCF_RANKING_MODE = "implicit"
 # GROUND TRUTH
 # =========================================================
 def build_ground_truth(test_df):
-    """
-    Extract what each user actually found relevant during the test period.
-
-    Relevance is a high rating OR a purchase. Purchases must be included: a
-    bought-but-unrated item is unambiguous evidence of relevance, and dropping
-    it would understate every model's recall by roughly the share of purchases
-    that go unrated.
-
-    Also returns graded relevance (the rating itself) so NDCG can distinguish a
-    5-star hit from a 4-star one.
-    """
+    """Extract what each user actually found relevant during the test period."""
     relevant_by_user = {}
     graded_by_user = {}
 
@@ -144,14 +90,7 @@ def build_ground_truth(test_df):
 # TRAIN-ONLY MODEL ARTIFACTS
 # =========================================================
 def build_train_artifacts(train_df, items_df):
-    """
-    Rebuild every model from the training period alone.
-
-    This is the step that actually enforces no-leakage. Reusing the artifacts in
-    data/processed would be far quicker, but those were fitted on the full
-    history including the test window, so every metric computed against them
-    would be inflated. The models must be refitted on train-only data.
-    """
+    """Rebuild every model from the training period alone."""
     print("  rebuilding models on the training period only ...")
 
     user_item_matrix = create_user_item_matrix(train_df)
@@ -244,13 +183,7 @@ def get_liked_items(user_id, train_df, valid_index):
 
 
 def recommend_content(user_id, content_similarity, train_df, seen, top_n=TOP_N):
-    """
-    Content-based TF-IDF recommendations.
-
-    The content similarity matrix is derived purely from item metadata, so it
-    carries no interaction leakage. Only the user's liked-item set is restricted
-    to the training period.
-    """
+    """Content-based TF-IDF recommendations."""
     liked = get_liked_items(user_id, train_df, content_similarity.index)
 
     if not liked:
@@ -277,13 +210,7 @@ def recommend_ncf_model(user_id, ncf_model, user_to_index, item_to_index, seen, 
 
 def recommend_hybrid_eval(user_id, artifacts, content_similarity, train_df,
                           ncf_model, user_to_index, item_to_index, seen, top_n=TOP_N):
-    """
-    Hybrid fusion using train-period artifacts only.
-
-    Mirrors HybridRecommender.fuse, but rebuilt against the training-period
-    models so the benchmark stays leak-free. The weights are identical, so the
-    comparison against the individual signals is fair.
-    """
+    """Hybrid fusion using train-period artifacts only."""
     # ---- Item-based CF (the strongest single signal) ----
     item_cf = pd.Series(dtype=float)
     matrix = artifacts["user_item_matrix"]

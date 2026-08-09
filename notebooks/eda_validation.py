@@ -1,25 +1,4 @@
-"""
-Synthetic Data Validation & Advanced EDA
-========================================
-Enterprise-Grade Recommendation System with Deep Learning
-
-Validates that the generated data actually behaves like real e-commerce data.
-
-This is not decorative. The generator deliberately engineers popularity bias,
-a long tail, sparsity, and cold-start cohorts; if those properties did not
-materialise, every downstream model would be trained on a flat random dataset
-and every metric reported later would be meaningless.
-
-Produces the three plots the business case marks as mandatory:
-    1. User activity distribution
-    2. Item popularity distribution
-    3. Interaction matrix sparsity
-
-plus long-tail, funnel, price, and segment analysis.
-
-Run:
-    python notebooks/eda_validation.py
-"""
+"""Synthetic Data Validation & Advanced EDA - proves the engineered properties landed."""
 
 import os
 import sys
@@ -44,6 +23,7 @@ sns.set_theme(style="whitegrid")
 
 
 def save_figure(name):
+    """Save the current figure to reports/figures."""
     path = os.path.join(FIGURES_PATH, name)
     plt.tight_layout()
     plt.savefig(path, dpi=120, bbox_inches="tight")
@@ -52,6 +32,7 @@ def save_figure(name):
 
 
 def main():
+    """Run every validation check and write the figures."""
     users_df, items_df, interactions_df = load_all()
 
     num_users = len(users_df)
@@ -137,13 +118,8 @@ def main():
 
     save_figure("02_item_popularity_distribution.png")
 
-    # Gini coefficient quantifies the concentration in a single number.
-    #
-    # The curve plotted above is sorted DESCENDING, which is the conventional
-    # "top X% of the catalogue drives Y% of demand" view. The Gini integral,
-    # however, is defined against the ASCENDING Lorenz curve - the one that sits
-    # below the diagonal. Reusing the descending curve integrates the area above
-    # the diagonal instead and returns the value with the sign flipped.
+    # Gini needs the ASCENDING Lorenz curve; the plot above is descending,
+    # and integrating that one returns the value sign-flipped.
     ascending = np.sort(item_popularity.values)
     lorenz = np.cumsum(ascending) / ascending.sum()
     population = np.arange(1, len(ascending) + 1) / len(ascending)

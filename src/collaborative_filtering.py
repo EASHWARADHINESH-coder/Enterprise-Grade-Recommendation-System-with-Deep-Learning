@@ -1,26 +1,4 @@
-"""
-Collaborative Filtering Improvements
-====================================
-Enterprise-Grade Recommendation System with Deep Learning
-
-Textbook collaborative filtering fails in specific, predictable ways on real
-platform data. This module addresses each one explicitly:
-
-    Problem                     Treatment implemented here
-    -------------------------   ------------------------------------------
-    >99% sparsity               latent-factor reconstruction (SVD)
-    Ratings missing on ~31%     implicit item-item CF from cart/purchase
-    Popularity bias             inverse-propensity popularity penalty
-    Long-tail starvation        explicit boost for under-exposed items
-    Cold-start users            profile-based fallback (segment + category)
-    Cold-start items            content similarity, never collaborative
-
-The re-ranking layer here is deliberately separate from score generation, so
-the same popularity correction applies identically to every upstream model.
-
-Run:
-    python src/collaborative_filtering.py
-"""
+"""Collaborative Filtering Improvements - de-biasing, re-ranking, cold start."""
 
 import os
 
@@ -45,38 +23,21 @@ PROCESSED_DATA_PATH = os.path.join(BASE_DIR, "data", "processed")
 # =========================================================
 COLD_START_MIN_INTERACTIONS = 3
 
-# The popularity penalty is  1 / (interaction_count + 1) ** POPULARITY_PENALTY_ALPHA.
-# Alpha is the accuracy-versus-diversity dial. Measured on this dataset, inside
-# the two-stage ranker below (top-10 overlap against the uncorrected ranking):
-#   alpha = 0.00  100% overlap - no correction at all
-#   alpha = 0.10   97% overlap - barely perceptible
-#   alpha = 0.20   92% overlap - visible tail promotion, relevance intact
-#   alpha = 0.35   86% overlap - noticeable relevance cost
-# The benchmarking report sweeps this against NDCG@10 and catalogue coverage
-# rather than asserting a value on intuition.
+# Accuracy vs diversity dial. Measured top-10 overlap against the
+# uncorrected ranking: 0.10 -> 97%, 0.20 -> 92%, 0.35 -> 86%.
 POPULARITY_PENALTY_ALPHA = 0.20
 
 LONG_TAIL_BOOST = 1.15
 
-# Two-stage ranking: retrieve this many candidates by raw relevance, then apply
-# the diversity re-ranking within that pool only. This is the standard
-# retrieve-then-rank split used in production recommenders, and it is what stops
-# the diversity correction from promoting irrelevant obscure items.
+# Retrieve this many by relevance, then diversify within that pool only.
 CANDIDATE_POOL_SIZE = 200
 
 
 # =========================================================
 # IMPLICIT ITEM-ITEM SIMILARITY
 # =========================================================
-def create_item_similarity_from_implicit(implicit_matrix):
-    """
-    Item-item similarity computed from cart/purchase intent rather than ratings.
-
-    This is the more robust of the two collaborative signals. Ratings are
-    missing on roughly a third of interactions and are subject to self-selection
-    (people rate what they feel strongly about); carting and buying are recorded
-    for everyone, every time.
-    """
+def create_item_similarity_from_implicit(implicit_matrix: pd.DataFrame) -> pd.DataFrame:
+    """Item-item similarity from cart/purchase intent rather than ratings."""
     similarity = cosine_similarity(implicit_matrix.T).astype(np.float32)
 
     similarity_df = pd.DataFrame(
@@ -92,22 +53,13 @@ def create_item_similarity_from_implicit(implicit_matrix):
 # =========================================================
 # POPULARITY DE-BIASING
 # =========================================================
-def build_popularity_lookup(item_popularity_features, penalty_alpha=POPULARITY_PENALTY_ALPHA):
-    """
-    Precompute the per-item re-ranking multipliers.
-
-    The penalty is 1 / (count + 1) ** alpha, an inverse-propensity style
-    correction with an explicit strength dial.
-
-    The obvious alternative, 1 / (1 + log1p(count)), was tried first and is a
-    trap: it spans a ~5x range across this catalogue, which is larger than the
-    spread of the normalised relevance scores it multiplies. The penalty then
-    dominates the ranking outright and the system recommends only near-zero
-    exposure items - trading away all relevance for diversity. The power form
-    with a small alpha keeps the correction a nudge rather than an override.
-    """
+def build_popularity_lookup(item_popularity_features: pd.DataFrame,
+                            penalty_alpha: float = POPULARITY_PENALTY_ALPHA) -> pd.DataFrame:
+    """Precompute the per-item re-ranking multipliers."""
     lookup = item_popularity_features.copy()
 
+    # Power form, not 1/(1+log1p(count)): that spans a ~5x range, wider than
+    # the scores it multiplies, and collapses the ranking onto obscure items.
     lookup["popularity_penalty"] = 1.0 / np.power(
         lookup["interaction_count"] + 1.0, penalty_alpha
     )
@@ -131,13 +83,13 @@ RERANK_DEFAULTS = {
     "average_rating": 0.0,
     "popularity_ratio": 0.0,
     "conversion_rate": 0.0,
-    "is_long_tail": 1.0,      # unknown items are treated as long-tail
+    "is_long_tail": 1.0,
     "popularity_penalty": 1.0,
     "long_tail_boost": 1.0,
 }
 
 
-def min_max_normalize(score_series):
+def min_max_normalize(score_series: pd.Series) -> pd.Series:
     """Scale a score vector to [0, 1]."""
     scores = score_series.astype(float)
 
@@ -151,36 +103,18 @@ def min_max_normalize(score_series):
     return (scores - lo) / (hi - lo)
 
 
-def rerank_with_popularity_balance(score_series, popularity_lookup,
-                                   candidate_pool=CANDIDATE_POOL_SIZE):
-    """
-    Retrieve by relevance, then diversify within the retrieved pool.
-
-    Two design decisions here, both learned the hard way:
-
-    1. RETRIEVE THEN RE-RANK. The diversity correction is applied only to the
-       top `candidate_pool` items by raw relevance, not to the whole catalogue.
-       Applying it catalogue-wide lets a near-zero-exposure item that the user
-       has no affinity for outrank a genuinely relevant one purely for being
-       obscure - the system starts recommending obscurity for its own sake.
-       Restricting the pool means every item in the final list was relevant
-       first and diverse second, which is the correct precedence.
-
-    2. NORMALISE BEFORE MULTIPLYING. Scores are min-max scaled to [0, 1] first.
-       SVD runs on the mean-centred matrix so its predictions are signed, and
-       multiplying a negative score by a penalty in (0, 1) moves it *up* toward
-       zero - silently inverting the correction for every negatively scored
-       item. Normalising first makes the multiplication mean what it says.
-
-    Returns the full frame rather than just the adjusted score, because the
-    explainability layer needs the individual components to justify why an item
-    moved up or down the ranking.
-    """
+def rerank_with_popularity_balance(score_series: pd.Series, popularity_lookup: pd.DataFrame,
+                                   candidate_pool: int = CANDIDATE_POOL_SIZE) -> pd.DataFrame:
+    """Retrieve by relevance, then diversify within the retrieved pool."""
     scores = score_series.astype(float)
 
+    # Pool first: applied catalogue-wide, the penalty promotes irrelevant
+    # obscure items above genuinely relevant ones.
     if candidate_pool is not None and len(scores) > candidate_pool:
         scores = scores.nlargest(candidate_pool)
 
+    # Normalise before multiplying: SVD scores are signed, and a negative
+    # score times a penalty below 1 moves UP, inverting the correction.
     recommendation_df = pd.DataFrame({
         "raw_score": min_max_normalize(scores),
         "original_score": scores,
@@ -207,20 +141,17 @@ def rerank_with_popularity_balance(score_series, popularity_lookup,
 # =========================================================
 # COLD-START DETECTION
 # =========================================================
-def get_cold_start_items(popularity_lookup, min_interactions=COLD_START_MIN_INTERACTIONS):
+def get_cold_start_items(popularity_lookup: pd.DataFrame,
+                         min_interactions: int = COLD_START_MIN_INTERACTIONS) -> list:
     """Item IDs with too little history to be scored collaboratively."""
     counts = popularity_lookup["interaction_count"]
     return counts.loc[counts < min_interactions].index.tolist()
 
 
-def get_cold_start_users(user_engagement, all_user_ids,
-                         min_interactions=COLD_START_MIN_INTERACTIONS):
-    """
-    User IDs needing fallback treatment.
-
-    Reindexed against the full user table so that users with zero interactions -
-    who never appear in the engagement frame - are included rather than missed.
-    """
+def get_cold_start_users(user_engagement: pd.DataFrame, all_user_ids: np.ndarray,
+                         min_interactions: int = COLD_START_MIN_INTERACTIONS) -> list:
+    """User IDs needing fallback treatment."""
+    # Reindex so zero-interaction users, absent from the frame, are included.
     counts = user_engagement["interaction_count"].reindex(all_user_ids, fill_value=0)
     return counts.loc[counts < min_interactions].index.tolist()
 
@@ -228,8 +159,9 @@ def get_cold_start_users(user_engagement, all_user_ids,
 # =========================================================
 # SCORING
 # =========================================================
-def recommend_svd_scores(user_id, user_item_matrix, predicted_ratings_df,
-                         popularity_lookup, n_candidates=200):
+def recommend_svd_scores(user_id: int, user_item_matrix: pd.DataFrame,
+                         predicted_ratings_df: pd.DataFrame, popularity_lookup: pd.DataFrame,
+                         n_candidates: int = 200) -> pd.Series:
     """Latent-factor scores for unseen items, popularity-corrected."""
     if user_id not in user_item_matrix.index:
         return pd.Series(dtype=float)
@@ -243,8 +175,9 @@ def recommend_svd_scores(user_id, user_item_matrix, predicted_ratings_df,
     return reranked["adjusted_score"].head(n_candidates)
 
 
-def recommend_implicit_scores(user_id, implicit_matrix, item_similarity_df,
-                              popularity_lookup, n_candidates=200):
+def recommend_implicit_scores(user_id: int, implicit_matrix: pd.DataFrame,
+                              item_similarity_df: pd.DataFrame, popularity_lookup: pd.DataFrame,
+                              n_candidates: int = 200) -> pd.Series:
     """Item-item implicit CF scores, popularity-corrected."""
     if user_id not in implicit_matrix.index:
         return pd.Series(dtype=float)
@@ -265,18 +198,12 @@ def recommend_implicit_scores(user_id, implicit_matrix, item_similarity_df,
     return reranked["adjusted_score"].head(n_candidates)
 
 
-def score_items_for_new_user(user_id, users_df, items_df, popularity_lookup, n_top=10):
-    """
-    Cold-start scoring from registration attributes alone.
-
-    Delegates to the content module's profile-based fallback so that a new user
-    is greeted with items matching both their stated category interest and their
-    segment's price band.
-    """
+def score_items_for_new_user(user_id: int, users_df: pd.DataFrame, items_df: pd.DataFrame,
+                             popularity_lookup: pd.DataFrame, n_top: int = 10) -> pd.DataFrame:
+    """Cold-start scoring from registration attributes alone."""
     user_row = users_df.loc[users_df["user_id"] == user_id]
 
     if user_row.empty:
-        # Genuinely unknown user: fall back to de-biased global popularity.
         ranked = rerank_with_popularity_balance(
             popularity_lookup["popularity_ratio"], popularity_lookup
         )
@@ -299,16 +226,17 @@ def score_items_for_new_user(user_id, users_df, items_df, popularity_lookup, n_t
 
 
 # =========================================================
-# PIPELINE ENTRY POINT
+# MAIN
 # =========================================================
-def main():
+def main() -> None:
+    """Build CF artifacts and demonstrate de-biasing and cold start."""
     users_df, items_df, interactions_df = load_all()
 
-    user_item_matrix = load_pickle("user_item_matrix.pkl")
     implicit_matrix = load_pickle("implicit_feedback_matrix.pkl")
     item_popularity = load_pickle("item_popularity_features.pkl")
     predicted_ratings_df = load_pickle("predicted_ratings.pkl")
     user_engagement = load_pickle("user_engagement_features.pkl")
+    user_item_matrix = load_pickle("user_item_matrix.pkl")
 
     print("Building collaborative filtering improvements ...")
 
@@ -324,31 +252,20 @@ def main():
     print("  cold-start items         :", len(cold_items))
     print("  cold-start users         :", len(cold_users))
 
-    # ---- Demonstrate popularity de-biasing -------------------------------
     active_user = int(user_item_matrix.index[0])
     raw = predicted_ratings_df.loc[active_user]
     reranked = rerank_with_popularity_balance(raw, popularity_lookup)
 
-    print("\nEffect of popularity de-biasing for user {}:".format(active_user))
-
+    print("\nPopularity de-biasing for user {}:".format(active_user))
     for k in (10, 20):
         before = raw.nlargest(k).index
         after = reranked.head(k).index
-
-        print("  top-{:<3} mean exposure  : {:>7,.0f}  ->  {:>7,.0f} interactions".format(
+        print("  top-{:<3} mean exposure : {:>7,.0f} -> {:>7,.0f}".format(
             k,
             popularity_lookup.loc[before, "interaction_count"].mean(),
             popularity_lookup.loc[after, "interaction_count"].mean(),
         ))
-        print("  top-{:<3} long-tail share: {:>7.0%}  ->  {:>7.0%}".format(
-            k,
-            popularity_lookup.loc[before, "is_long_tail"].mean(),
-            popularity_lookup.loc[after, "is_long_tail"].mean(),
-        ))
 
-    print("  (falling exposure and rising long-tail share = the correction is working)")
-
-    # ---- Demonstrate cold-start fallback ---------------------------------
     if cold_users:
         cold_user_id = int(cold_users[0])
         print("\nCold-start fallback for user {}:".format(cold_user_id))

@@ -1,30 +1,4 @@
-"""
-Application Layer - FastAPI Recommendation Service
-==================================================
-Enterprise-Grade Recommendation System with Deep Learning
-
-Serves the hybrid recommender over HTTP.
-
-Endpoints:
-    GET  /                        service metadata and health
-    GET  /health                  readiness probe
-    GET  /recommend/{user_id}     personalised top-N with explanations
-    GET  /similar-items/{item_id} content-similar products
-    GET  /users/{user_id}         customer profile and engagement summary
-    GET  /items/{item_id}         product detail
-    POST /recommend/batch         batch scoring for offline jobs
-
-The recommendation logic lives entirely in models/hybrid_recommender.py. This
-module is transport only - request validation, response shaping, error mapping.
-Keeping the split clean is what lets the Streamlit dashboard and this API return
-identical recommendations for the same customer.
-
-Run:
-    uvicorn app_fastapi:app --reload --port 8000    (from the app/ directory)
-    python app/app_fastapi.py                       (equivalent, from the root)
-
-Then open http://127.0.0.1:8000/docs
-"""
+"""Application Layer - FastAPI Recommendation Service (transport only)."""
 
 import os
 import sys
@@ -66,9 +40,8 @@ recommender = None
 
 # =========================================================
 # RESPONSE MODELS
-# Pydantic models are the API contract. They also do the output validation:
-# if a scoring change ever starts emitting nulls where a price is expected,
-# the response fails here rather than silently reaching the storefront.
+# Pydantic also validates output: a null where a price is expected
+# fails here rather than reaching the storefront.
 # =========================================================
 class SignalContribution(BaseModel):
     signal: str
@@ -220,13 +193,7 @@ def build_recommendation_items(user_id, frame, include_breakdown):
 # =========================================================
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """
-    Load all model artifacts once at startup.
-
-    Loading here rather than per-request matters: the similarity matrices are
-    several hundred megabytes, and reloading them per call would put response
-    times in the tens of seconds.
-    """
+    """Load all model artifacts once at startup."""
     global recommender
 
     print("Loading recommendation artifacts ...")
@@ -306,13 +273,7 @@ def recommend(
     top_n: int = Query(10, ge=1, le=MAX_TOP_N, description="Number of items to return"),
     explain: bool = Query(True, description="Include per-signal score attribution"),
 ):
-    """
-    Personalised recommendations for a customer.
-
-    Always returns a `strategy` field. An unknown or inactive customer is served
-    through a cold-start path and labelled as such rather than being presented
-    as a personalised result - a caller must be able to tell the difference.
-    """
+    """Personalised recommendations for a customer."""
     require_ready()
 
     if user_id < 1:
@@ -350,12 +311,7 @@ def similar_items(
     item_id: int,
     top_n: int = Query(10, ge=1, le=MAX_TOP_N),
 ):
-    """
-    Content-similar products.
-
-    Driven purely by TF-IDF over the product text, so it works for any item in
-    the catalogue - including one listed today with zero sales history.
-    """
+    """Content-similar products."""
     require_ready()
 
     source = recommender.item_details(item_id)
@@ -450,13 +406,7 @@ def get_item(item_id: int):
 # =========================================================
 @app.get("/explain/{user_id}/{item_id}")
 def explain(user_id: int, item_id: int):
-    """
-    Full three-part explanation for one recommendation.
-
-    Returns the same structured evidence the dashboard renders: signal
-    attribution, the customer's own comparable purchases, similar-customer
-    evidence, and the content terms that link the items.
-    """
+    """Full three-part explanation for one recommendation."""
     require_ready()
 
     if recommender.item_details(item_id) is None:
@@ -492,12 +442,7 @@ def explain(user_id: int, item_id: int):
 # =========================================================
 @app.post("/recommend/batch", response_model=BatchResponse)
 def recommend_batch(request: BatchRequest):
-    """
-    Score many customers in one call.
-
-    Exists for the offline path - nightly email campaigns and pre-computed
-    homepage slots - where per-user HTTP round trips would dominate the runtime.
-    """
+    """Score many customers in one call."""
     require_ready()
 
     results = {}

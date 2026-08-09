@@ -1,23 +1,4 @@
-"""
-Preprocessing & Feature Engineering
-===================================
-Enterprise-Grade Recommendation System with Deep Learning
-
-Turns the raw interaction log into the structures every recommender needs:
-
-    user_item_matrix              explicit ratings           (CF, SVD)
-    normalized_user_item_matrix   mean-centred ratings       (SVD)
-    implicit_feedback_matrix      cart/purchase intent       (implicit CF, NCF)
-    item_popularity_features      exposure & long-tail flags (re-ranking)
-    item_content_features         price/category/brand       (cold-start items)
-    user_profile_features         segment/age/gender         (cold-start users)
-
-Matrices are stored as float32. At 6,000 x 2,500 the explicit matrix alone is
-15 million cells; float64 would double the memory for no modelling benefit.
-
-Run:
-    python src/preprocessing.py
-"""
+"""Preprocessing & Feature Engineering - builds the matrices models consume."""
 
 import os
 import pickle
@@ -40,24 +21,16 @@ os.makedirs(PROCESSED_DATA_PATH, exist_ok=True)
 # =========================================================
 # SETTINGS
 # =========================================================
-# An item at or below this interaction percentile counts as long-tail.
 LONG_TAIL_QUANTILE = 0.80
-
-# A rating at or above this counts as a positive signal for ranking metrics.
 RELEVANCE_RATING_THRESHOLD = 4
 
 
 # =========================================================
 # EXPLICIT RATING MATRIX
 # =========================================================
-def create_user_item_matrix(interactions_df):
-    """
-    Build the user x item explicit rating matrix.
-
-    Only rated interactions contribute. Unrated cells become 0, which the
-    downstream models treat as "no explicit signal" rather than "rated zero" -
-    the rating scale starts at 1, so 0 is unambiguous.
-    """
+def create_user_item_matrix(interactions_df: pd.DataFrame) -> pd.DataFrame:
+    """Build the user x item explicit rating matrix."""
+    # Ratings start at 1, so a 0 unambiguously means "no explicit signal".
     rated = interactions_df.dropna(subset=["rating"])
 
     return rated.pivot_table(
@@ -72,19 +45,11 @@ def create_user_item_matrix(interactions_df):
 # =========================================================
 # MEAN-CENTRED RATING MATRIX
 # =========================================================
-def create_normalized_user_item_matrix(interactions_df):
-    """
-    Mean-centre each user's ratings before factorisation.
-
-    Without this, a generous rater and a harsh rater who rank items identically
-    look like different users to the model. Centring removes that per-user
-    offset so the factors capture relative preference.
-
-    Uses a vectorised groupby-transform; the row-wise .apply equivalent is
-    orders of magnitude slower on a log of this size.
-    """
+def create_normalized_user_item_matrix(interactions_df: pd.DataFrame) -> pd.DataFrame:
+    """Mean-centre each user's ratings so factors capture relative preference."""
     rated = interactions_df.dropna(subset=["rating"]).copy()
 
+    # transform broadcasts the group mean in one pass; .apply is far slower.
     user_mean = rated.groupby("user_id")["rating"].transform("mean")
     rated["normalized_rating"] = rated["rating"] - user_mean
 
@@ -100,15 +65,8 @@ def create_normalized_user_item_matrix(interactions_df):
 # =========================================================
 # IMPLICIT FEEDBACK MATRIX
 # =========================================================
-def create_implicit_feedback_matrix(interactions_df):
-    """
-    Build the binary intent matrix from the engagement funnel.
-
-    A cell is 1 when the user added the item to cart or purchased it. This is a
-    genuine behavioural signal, not a rating threshold applied after the fact -
-    which is why it stays available for the ~31% of interactions that carry no
-    star rating at all.
-    """
+def create_implicit_feedback_matrix(interactions_df: pd.DataFrame) -> pd.DataFrame:
+    """Build the binary cart/purchase intent matrix."""
     interactions_copy = interactions_df.copy()
 
     if "implicit_feedback" not in interactions_copy.columns:
@@ -128,15 +86,9 @@ def create_implicit_feedback_matrix(interactions_df):
 # =========================================================
 # ITEM POPULARITY / LONG-TAIL FEATURES
 # =========================================================
-def create_item_popularity_features(interactions_df, items_df=None):
-    """
-    Compute per-item exposure statistics used by the popularity re-ranker.
-
-    When `items_df` is supplied, items with zero interactions are included with
-    counts of 0. That matters: cold-start items are exactly the ones missing
-    from the interaction log, and silently dropping them would make the
-    cold-start handling untestable.
-    """
+def create_item_popularity_features(interactions_df: pd.DataFrame,
+                                    items_df: pd.DataFrame = None) -> pd.DataFrame:
+    """Per-item exposure stats used by the popularity re-ranker."""
     item_stats = interactions_df.groupby("item_id").agg(
         interaction_count=("item_id", "count"),
         average_rating=("rating", "mean"),
@@ -145,6 +97,8 @@ def create_item_popularity_features(interactions_df, items_df=None):
         avg_view_time=("view_time_seconds", "mean"),
     )
 
+    # Reindex keeps zero-interaction items, which never appear in the log
+    # and are exactly the cold-start cases that must not be dropped.
     if items_df is not None:
         item_stats = item_stats.reindex(items_df["item_id"].values)
 
@@ -161,8 +115,6 @@ def create_item_popularity_features(interactions_df, items_df=None):
         item_stats["interaction_count"] / max_count if max_count > 0 else 0.0
     )
 
-    # Conversion rate is the commercially meaningful quality signal: an item
-    # with few views but a high buy-through rate deserves promotion.
     item_stats["conversion_rate"] = np.where(
         item_stats["interaction_count"] > 0,
         item_stats["purchase_count"] / item_stats["interaction_count"],
@@ -178,15 +130,8 @@ def create_item_popularity_features(interactions_df, items_df=None):
 # =========================================================
 # ITEM CONTENT FEATURES
 # =========================================================
-def create_item_content_features(items_df):
-    """
-    Build a numeric item feature matrix for cold-start scoring.
-
-    This is the structured counterpart to the TF-IDF text representation: price
-    and quality are scaled to [0, 1], and category / subcategory / brand are
-    one-hot encoded. A brand-new item has all of these on day one, which is
-    what makes it recommendable before it has any interaction history.
-    """
+def create_item_content_features(items_df: pd.DataFrame) -> pd.DataFrame:
+    """Numeric item features for cold-start scoring."""
     items_copy = items_df.copy()
 
     numeric_cols = [c for c in ["price", "base_quality", "price_percentile"]
@@ -212,14 +157,8 @@ def create_item_content_features(items_df):
 # =========================================================
 # USER PROFILE FEATURES
 # =========================================================
-def create_user_profile_features(users_df):
-    """
-    Build a numeric user feature matrix for cold-start scoring.
-
-    `user_segment` is the field that carries commercial meaning here - it is
-    what lets the system make a sensible first recommendation to a user who has
-    never clicked anything, purely from who they signed up as.
-    """
+def create_user_profile_features(users_df: pd.DataFrame) -> pd.DataFrame:
+    """Numeric user features for cold-start scoring."""
     users_copy = users_df.copy()
 
     if "age" in users_copy.columns:
@@ -245,14 +184,8 @@ def create_user_profile_features(users_df):
 # =========================================================
 # USER ENGAGEMENT FEATURES
 # =========================================================
-def create_user_engagement_features(interactions_df):
-    """
-    Aggregate behavioural features per user.
-
-    Used by the governance notebook to check that recommendation quality does
-    not collapse for low-activity users, and by the dashboard to describe who a
-    selected user actually is.
-    """
+def create_user_engagement_features(interactions_df: pd.DataFrame) -> pd.DataFrame:
+    """Aggregate behavioural features per user."""
     engagement = interactions_df.groupby("user_id").agg(
         interaction_count=("item_id", "count"),
         distinct_items=("item_id", "nunique"),
@@ -275,19 +208,13 @@ def create_user_engagement_features(interactions_df):
 
 
 # =========================================================
-# RELEVANCE LABELS  (used by the ranking metrics)
+# RELEVANCE LABELS
 # =========================================================
-def mark_relevant_interactions(interactions_df):
-    """
-    Flag which interactions count as a "hit" for Precision@K / Recall@K.
-
-    An interaction is relevant if the user rated it at or above the threshold,
-    OR if they purchased it. Including purchases matters because a bought-but-
-    unrated item is unambiguous evidence of relevance, and dropping it would
-    understate every model's recall.
-    """
+def mark_relevant_interactions(interactions_df: pd.DataFrame) -> pd.DataFrame:
+    """Flag which interactions count as a hit for the ranking metrics."""
     interactions_copy = interactions_df.copy()
 
+    # Purchases count even when unrated - dropping them understates recall.
     rated_high = interactions_copy["rating"] >= RELEVANCE_RATING_THRESHOLD
     purchased = interactions_copy["purchase"] == 1
 
@@ -298,12 +225,14 @@ def mark_relevant_interactions(interactions_df):
 # =========================================================
 # PERSISTENCE
 # =========================================================
-def save_pickle(obj, filename):
+def save_pickle(obj, filename: str) -> None:
+    """Write an artifact to data/processed."""
     with open(os.path.join(PROCESSED_DATA_PATH, filename), "wb") as f:
         pickle.dump(obj, f)
 
 
-def load_pickle(filename):
+def load_pickle(filename: str):
+    """Read an artifact from data/processed."""
     path = os.path.join(PROCESSED_DATA_PATH, filename)
     if not os.path.exists(path):
         raise FileNotFoundError(
@@ -315,42 +244,31 @@ def load_pickle(filename):
 
 
 # =========================================================
-# PIPELINE ENTRY POINT
+# MAIN
 # =========================================================
-def main():
+def main() -> None:
+    """Build and save every preprocessing artifact."""
     users_df, items_df, interactions_df = load_all()
 
     print("Building preprocessing artifacts ...")
 
-    user_item_matrix = create_user_item_matrix(interactions_df)
-    save_pickle(user_item_matrix, "user_item_matrix.pkl")
-    print("  user_item_matrix            :", user_item_matrix.shape)
+    artifacts = [
+        ("user_item_matrix", create_user_item_matrix(interactions_df)),
+        ("normalized_user_item_matrix", create_normalized_user_item_matrix(interactions_df)),
+        ("implicit_feedback_matrix", create_implicit_feedback_matrix(interactions_df)),
+        ("item_popularity_features", create_item_popularity_features(interactions_df, items_df)),
+        ("item_content_features", create_item_content_features(items_df)),
+        ("user_profile_features", create_user_profile_features(users_df)),
+        ("user_engagement_features", create_user_engagement_features(interactions_df)),
+    ]
 
-    normalized_matrix = create_normalized_user_item_matrix(interactions_df)
-    save_pickle(normalized_matrix, "normalized_user_item_matrix.pkl")
-    print("  normalized_user_item_matrix :", normalized_matrix.shape)
+    for name, obj in artifacts:
+        save_pickle(obj, name + ".pkl")
+        print("  {:<28}: {}".format(name, obj.shape))
 
-    implicit_matrix = create_implicit_feedback_matrix(interactions_df)
-    save_pickle(implicit_matrix, "implicit_feedback_matrix.pkl")
-    print("  implicit_feedback_matrix    :", implicit_matrix.shape)
-
-    item_popularity = create_item_popularity_features(interactions_df, items_df)
-    save_pickle(item_popularity, "item_popularity_features.pkl")
-    print("  item_popularity_features    :", item_popularity.shape)
-
-    item_content = create_item_content_features(items_df)
-    save_pickle(item_content, "item_content_features.pkl")
-    print("  item_content_features       :", item_content.shape)
-
-    user_profile = create_user_profile_features(users_df)
-    save_pickle(user_profile, "user_profile_features.pkl")
-    print("  user_profile_features       :", user_profile.shape)
-
-    user_engagement = create_user_engagement_features(interactions_df)
-    save_pickle(user_engagement, "user_engagement_features.pkl")
-    print("  user_engagement_features    :", user_engagement.shape)
-
+    item_popularity = artifacts[3][1]
     sparsity = 1 - (len(interactions_df) / (len(users_df) * len(items_df)))
+
     print("\nInteraction matrix sparsity : {:.4%}".format(sparsity))
     print("Cold-start items (<3 events):",
           int((item_popularity["interaction_count"] < 3).sum()))

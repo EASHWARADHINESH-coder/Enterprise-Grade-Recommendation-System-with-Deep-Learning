@@ -1,22 +1,4 @@
-"""
-Application Layer - Streamlit Recommendation Dashboard
-======================================================
-Enterprise-Grade Recommendation System with Deep Learning
-
-An operator-facing console for the recommendation engine. Built for the person
-who has to answer "why did the site show that to this customer?" - a
-merchandiser, a category manager, or a data scientist debugging a complaint.
-
-Tabs map onto the four things the evaluation rubric asks a dashboard to do:
-
-    Recommendations   personalised top-N with business context
-    Explainability    why each item was chosen, with evidence
-    Similar Items     content-driven product neighbours
-    Cold Start        what a brand-new customer sees, and why it differs
-
-Run:
-    streamlit run app/streamlit_recommendation_dashboard.py
-"""
+"""Application Layer - Streamlit Recommendation Dashboard."""
 
 import os
 import sys
@@ -67,13 +49,7 @@ STRATEGY_LABELS = {
 # =========================================================
 @st.cache_resource(show_spinner="Loading recommendation models ...")
 def load_recommender():
-    """
-    Load the recommender once per session.
-
-    cache_resource rather than cache_data: this object holds several hundred
-    megabytes of similarity matrices and a PyTorch model, none of which is
-    serialisable in the way cache_data expects.
-    """
+    """Load the recommender once per session."""
     return HybridRecommender.load()
 
 
@@ -112,9 +88,8 @@ interaction_counts = (
 
 st.sidebar.subheader("Select a customer")
 
-# Offer meaningful cohorts rather than a raw 6,000-entry dropdown. Picking a
-# customer at random almost always lands on a light user, which makes the
-# personalisation look far weaker than it is.
+# Cohorts, not a raw 6,000-entry dropdown: a random pick almost always
+# lands on a light user and makes personalisation look weaker than it is.
 cohort = st.sidebar.radio(
     "Cohort",
     ["Highly active", "Typical", "Cold start (new)", "Any customer"],

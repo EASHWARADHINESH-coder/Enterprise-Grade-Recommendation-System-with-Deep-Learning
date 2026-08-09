@@ -1,34 +1,4 @@
-"""
-Deep Learning Recommendation Model - Neural Collaborative Filtering (PyTorch)
-============================================================================
-Enterprise-Grade Recommendation System with Deep Learning
-
-Why a neural model at all, when SVD already factorises the same matrix?
-
-Matrix factorisation scores an item as the dot product of a user vector and an
-item vector. That is a fixed, linear interaction: the model can learn *how much*
-a user likes a latent dimension, but the dimensions can only ever combine
-additively. This dataset was generated with a genuinely non-linear rule - a user
-buys when the category matches AND the price sits in their segment's band. A dot
-product cannot represent a conjunction. An MLP over concatenated embeddings can.
-
-That is the claim this module exists to test, and the benchmarking step reports
-whether it actually holds rather than assuming it.
-
-Architecture:
-    user_id -> embedding (32d) --.
-                                  |-> concat (64d) -> MLP [128, 64, 32] -> score
-    item_id -> embedding (32d) --'
-
-    ReLU activations, dropout, weight decay, early stopping on validation loss.
-
-Both feedback modes are supported:
-    explicit  -> predicts the star rating,      MSELoss
-    implicit  -> predicts cart/purchase intent, BCEWithLogitsLoss
-
-Run:
-    python models/ncf_recommender.py
-"""
+"""Neural Collaborative Filtering (PyTorch) - the deep learning model."""
 
 import copy
 import os
@@ -41,7 +11,6 @@ import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader, Dataset
 
-# Make the shared modules in src/ importable from this folder.
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.append(os.path.join(BASE_DIR, "src"))
 
@@ -73,42 +42,28 @@ WEIGHT_DECAY = 1e-5
 PATIENCE = 4
 VALID_RATIO = 0.2
 
-# Negative samples drawn per observed positive, for the implicit model.
-# 4 is the ratio used in the original NCF paper (He et al., 2017).
+# Negatives sampled per observed positive (ratio from the NCF paper).
 NUM_NEGATIVES = 4
 
-# Final 90 days are held out as the test period for the time-based split.
 TEST_PERIOD_DAYS = 90
 
-# Overrides for the implicit model.
-#
-# With 1:4 negative sampling the implicit training set is ~230k rows against
-# ~260k embedding parameters, so the default regularisation lets it reach its
-# best validation loss in a single epoch and overfit from epoch 2 onward.
-# Measured across a regularisation sweep, final quality is capacity-bound at
-# ~0.858 accuracy regardless of settings - but these values reach that ceiling
-# over ~20 epochs instead of 1, giving a genuine convergence curve to inspect
-# and a meaningful early-stopping signal.
+# Implicit model overrides: defaults peak at epoch 1 then overfit.
+# Quality is capacity-bound at ~0.858 either way, but these give a
+# real convergence curve over ~20 epochs.
 IMPLICIT_WEIGHT_DECAY = 1e-3
 IMPLICIT_DROPOUT = 0.40
 
 
-def get_device():
+def get_device() -> str:
+    """Return cuda if available, else cpu."""
     return "cuda" if torch.cuda.is_available() else "cpu"
 
 
 # =========================================================
 # ID ENCODING
 # =========================================================
-def encode_ids(interactions_df, tag="ncf"):
-    """
-    Map sparse user_id / item_id values onto contiguous embedding indices.
-
-    nn.Embedding is a lookup table indexed 0..N-1, so raw IDs cannot be used
-    directly - and the mappings must be persisted, because serving has to
-    reproduce exactly the same index for a given user or the embedding row
-    returned is meaningless.
-    """
+def encode_ids(interactions_df: pd.DataFrame, tag: str = "ncf"):
+    """Map sparse IDs onto contiguous embedding indices and persist the maps."""
     encoded = interactions_df.copy()
 
     unique_users = sorted(encoded["user_id"].unique())
@@ -122,6 +77,8 @@ def encode_ids(interactions_df, tag="ncf"):
     encoded["user_idx"] = encoded["user_id"].map(user_to_index)
     encoded["item_idx"] = encoded["item_id"].map(item_to_index)
 
+    # Maps must persist: serving has to reproduce the same index or the
+    # embedding row returned belongs to someone else.
     save_pickle(user_to_index, tag + "_user_to_index.pkl")
     save_pickle(item_to_index, tag + "_item_to_index.pkl")
     save_pickle(index_to_user, tag + "_index_to_user.pkl")
@@ -133,15 +90,9 @@ def encode_ids(interactions_df, tag="ncf"):
 # =========================================================
 # SPLITTING
 # =========================================================
-def time_based_split(interactions_df, test_days=TEST_PERIOD_DAYS):
-    """
-    Hold out the most recent `test_days` as the test period.
-
-    A random split leaks the future into the training set: the model gets to see
-    what a user did in November while being asked to predict their October
-    behaviour. Every reported metric is inflated as a result. The business case
-    mandates a time-based split precisely to close that hole.
-    """
+def time_based_split(interactions_df: pd.DataFrame, test_days: int = TEST_PERIOD_DAYS):
+    """Hold out the most recent test_days as the test period."""
+    # A random split leaks the future and inflates every metric.
     interactions_copy = interactions_df.copy()
     interactions_copy["timestamp"] = pd.to_datetime(interactions_copy["timestamp"])
 
@@ -153,52 +104,30 @@ def time_based_split(interactions_df, test_days=TEST_PERIOD_DAYS):
     return train_df, test_df, cutoff
 
 
-def train_valid_split(interactions_df, valid_ratio=VALID_RATIO, random_state=RANDOM_SEED):
-    """
-    Split the *training* period into train and validation folds.
-
-    Random is acceptable here: this fold only drives early stopping, and the
-    held-out test period remains strictly later than anything either fold sees.
-    """
+def train_valid_split(interactions_df: pd.DataFrame, valid_ratio: float = VALID_RATIO,
+                      random_state: int = RANDOM_SEED):
+    """Split the training period into train and validation folds."""
     shuffled = interactions_df.sample(frac=1.0, random_state=random_state).reset_index(drop=True)
     split_index = int(len(shuffled) * (1 - valid_ratio))
     return shuffled.iloc[:split_index].copy(), shuffled.iloc[split_index:].copy()
 
 
 # =========================================================
-# NEGATIVE SAMPLING  (implicit feedback)
+# NEGATIVE SAMPLING
 # =========================================================
-def build_implicit_training_frame(encoded_df, num_items, num_negatives=NUM_NEGATIVES,
-                                  seed=RANDOM_SEED):
-    """
-    Build the implicit training set with negative sampling.
-
-    This is the single most important detail in implicit-feedback NCF, and
-    getting it wrong is subtle because the model still trains - it just learns
-    nothing useful.
-
-    The naive framing is to take the interaction log and label each row by
-    whether it converted. But every row in the log is an item the platform
-    already chose to show the user, so the model is being asked "given they
-    clicked it, did they buy it?" - a conversion problem. The retrieval problem
-    a recommender must actually solve is "out of the entire catalogue, which
-    items would this user engage with at all?", and that question has no
-    negative examples anywhere in the log.
-
-    Measured on this dataset, the naive framing scored 53% accuracy (barely
-    above chance) with F1 0.35. With sampled negatives the same architecture
-    reaches 86% accuracy and F1 0.59.
-
-    Negatives are sampled from items the user has never interacted with, at
-    `num_negatives` per positive.
-    """
+def build_implicit_training_frame(encoded_df: pd.DataFrame, num_items: int,
+                                  num_negatives: int = NUM_NEGATIVES,
+                                  seed: int = RANDOM_SEED) -> pd.DataFrame:
+    """Build the implicit training set with sampled negatives."""
+    # Without negatives the model is asked "given they clicked, did they buy?"
+    # - a conversion problem. Retrieval needs contrast against the catalogue.
+    # Measured: 53% accuracy / NDCG 0.0000 without, 86% / 0.0576 with.
     rng = np.random.default_rng(seed)
 
     positives = encoded_df.loc[encoded_df["implicit_feedback"] == 1, ["user_idx", "item_idx"]]
 
-    # Exclude everything the user has touched - including items they viewed but
-    # did not cart. Those are ambiguous, not confirmed negatives, and labelling
-    # them 0 would teach the model that browsing implies disinterest.
+    # Exclude everything touched, including viewed-not-carted: those are
+    # ambiguous, not confirmed negatives.
     seen_by_user = encoded_df.groupby("user_idx")["item_idx"].apply(set)
 
     negative_users = []
@@ -208,8 +137,6 @@ def build_implicit_training_frame(encoded_df, num_items, num_negatives=NUM_NEGAT
         required = len(group) * num_negatives
         seen = seen_by_user.get(user_idx, set())
 
-        # Oversample then filter; with a 2,500-item catalogue and ~20 seen items
-        # per user the rejection rate is negligible.
         candidates = rng.integers(0, num_items, size=int(required * 1.5) + 16)
         sampled = [int(c) for c in candidates if c not in seen][:required]
 
@@ -237,12 +164,10 @@ def build_implicit_training_frame(encoded_df, num_items, num_negatives=NUM_NEGAT
 class InteractionsDataset(Dataset):
     """Wraps encoded interactions as (user_idx, item_idx, label) tensors."""
 
-    def __init__(self, df, feedback_type="explicit"):
+    def __init__(self, df: pd.DataFrame, feedback_type: str = "explicit"):
         if "label" in df.columns:
-            # Pre-built frame (implicit path, after negative sampling).
             labels = df["label"].to_numpy(dtype=np.float32)
         elif feedback_type == "explicit":
-            # Only rated rows carry an explicit target.
             df = df.dropna(subset=["rating"])
             labels = df["rating"].to_numpy(dtype=np.float32)
         elif feedback_type == "implicit":
@@ -254,7 +179,7 @@ class InteractionsDataset(Dataset):
         self.items = torch.tensor(df["item_idx"].to_numpy(), dtype=torch.long)
         self.labels = torch.tensor(labels, dtype=torch.float32)
 
-    def __len__(self):
+    def __len__(self) -> int:
         return len(self.users)
 
     def __getitem__(self, idx):
@@ -265,16 +190,10 @@ class InteractionsDataset(Dataset):
 # MODEL
 # =========================================================
 class NeuralCollaborativeFiltering(nn.Module):
-    """
-    NCF: two embedding tables feeding an MLP over their concatenation.
+    """Two embedding tables feeding an MLP over their concatenation."""
 
-    Concatenation rather than element-wise product is the whole point. A product
-    hard-codes a multiplicative interaction and reduces to matrix factorisation;
-    concatenation leaves the interaction function itself to be learned.
-    """
-
-    def __init__(self, num_users, num_items, embedding_dim=EMBEDDING_DIM,
-                 hidden_dims=None, dropout=DROPOUT):
+    def __init__(self, num_users: int, num_items: int, embedding_dim: int = EMBEDDING_DIM,
+                 hidden_dims: list = None, dropout: float = DROPOUT):
         super().__init__()
 
         if hidden_dims is None:
@@ -296,9 +215,9 @@ class NeuralCollaborativeFiltering(nn.Module):
 
         self.initialize_weights()
 
-    def initialize_weights(self):
-        # Small-variance embedding init keeps early predictions near the data
-        # mean; large random embeddings make the first epochs pure noise.
+    def initialize_weights(self) -> None:
+        """Small embedding init, Xavier for the MLP."""
+        # Large random embeddings make the first epochs pure noise.
         nn.init.normal_(self.user_embedding.weight, std=0.01)
         nn.init.normal_(self.item_embedding.weight, std=0.01)
 
@@ -311,6 +230,9 @@ class NeuralCollaborativeFiltering(nn.Module):
         nn.init.zeros_(self.output_layer.bias)
 
     def forward(self, user_indices, item_indices):
+        """Score a batch of (user, item) pairs."""
+        # Concatenation, not element-wise product: a product hard-codes a
+        # multiplicative interaction and reduces this to matrix factorisation.
         user_vec = self.user_embedding(user_indices)
         item_vec = self.item_embedding(item_indices)
 
@@ -323,14 +245,9 @@ class NeuralCollaborativeFiltering(nn.Module):
 # EARLY STOPPING
 # =========================================================
 class EarlyStopping:
-    """
-    Stop when validation loss stops improving, and restore the best weights.
+    """Stop when validation loss stops improving, restoring the best weights."""
 
-    Restoring matters as much as stopping. Without it you keep the weights from
-    the last (worse) epoch, which defeats the purpose of having watched at all.
-    """
-
-    def __init__(self, patience=PATIENCE, min_delta=1e-4):
+    def __init__(self, patience: int = PATIENCE, min_delta: float = 1e-4):
         self.patience = patience
         self.min_delta = min_delta
         self.best_loss = float("inf")
@@ -338,7 +255,10 @@ class EarlyStopping:
         self.best_state = None
         self.best_epoch = 0
 
-    def step(self, valid_loss, model, epoch):
+    def step(self, valid_loss: float, model: nn.Module, epoch: int) -> bool:
+        """Record the epoch and report whether training should stop."""
+        # Restoring matters as much as stopping: otherwise you keep the
+        # weights from the last, worse epoch.
         if valid_loss < self.best_loss - self.min_delta:
             self.best_loss = valid_loss
             self.counter = 0
@@ -353,10 +273,11 @@ class EarlyStopping:
 # =========================================================
 # TRAINING
 # =========================================================
-def train_ncf_model(model, train_loader, valid_loader, feedback_type="explicit",
-                    learning_rate=LEARNING_RATE, weight_decay=WEIGHT_DECAY,
-                    epochs=EPOCHS, patience=PATIENCE, device=None, verbose=True):
-    """Train with Adam, L2 weight decay, and early stopping on validation loss."""
+def train_ncf_model(model: nn.Module, train_loader: DataLoader, valid_loader: DataLoader,
+                    feedback_type: str = "explicit", learning_rate: float = LEARNING_RATE,
+                    weight_decay: float = WEIGHT_DECAY, epochs: int = EPOCHS,
+                    patience: int = PATIENCE, device: str = None, verbose: bool = True):
+    """Train with Adam, weight decay and early stopping."""
     if device is None:
         device = get_device()
 
@@ -387,6 +308,7 @@ def train_ncf_model(model, train_loader, valid_loader, feedback_type="explicit",
             optimizer.step()
             train_losses.append(loss.item())
 
+        # eval() disables dropout; no_grad() skips gradient tracking.
         model.eval()
         valid_losses = []
         with torch.no_grad():
@@ -424,8 +346,8 @@ def train_ncf_model(model, train_loader, valid_loader, feedback_type="explicit",
 # =========================================================
 # EVALUATION
 # =========================================================
-def evaluate_explicit_model(model, data_loader, device=None):
-    """Prediction-error metrics for the explicit (rating) model."""
+def evaluate_explicit_model(model, data_loader, device: str = None) -> dict:
+    """Prediction-error metrics for the explicit model."""
     if device is None:
         device = get_device()
 
@@ -449,8 +371,9 @@ def evaluate_explicit_model(model, data_loader, device=None):
     }
 
 
-def evaluate_implicit_model(model, data_loader, threshold=0.5, device=None):
-    """Classification metrics for the implicit (intent) model."""
+def evaluate_implicit_model(model, data_loader, threshold: float = 0.5,
+                            device: str = None) -> dict:
+    """Classification metrics for the implicit model."""
     if device is None:
         device = get_device()
 
@@ -486,15 +409,10 @@ def evaluate_implicit_model(model, data_loader, threshold=0.5, device=None):
 # =========================================================
 # INFERENCE
 # =========================================================
-def score_all_items(model, user_id, user_to_index, item_to_index,
-                    exclude_item_ids=None, feedback_type="explicit", device=None):
-    """
-    Score every candidate item for one user in a single batched forward pass.
-
-    Scoring items one at a time would issue thousands of tiny forward passes per
-    request; batching keeps a full catalogue scoring inside a few milliseconds,
-    which is what makes real-time serving viable.
-    """
+def score_all_items(model, user_id: int, user_to_index: dict, item_to_index: dict,
+                    exclude_item_ids: list = None, feedback_type: str = "explicit",
+                    device: str = None) -> pd.Series:
+    """Score every candidate item for one user in a single batched pass."""
     if device is None:
         device = get_device()
 
@@ -510,6 +428,7 @@ def score_all_items(model, user_id, user_to_index, item_to_index,
     if not candidate_ids:
         return pd.Series(dtype=float)
 
+    # One batched pass; per-item calls would be thousands of tiny forwards.
     item_tensor = torch.tensor([item_to_index[i] for i in candidate_ids],
                                dtype=torch.long, device=device)
     user_tensor = torch.full((len(candidate_ids),), user_to_index[user_id],
@@ -524,9 +443,10 @@ def score_all_items(model, user_id, user_to_index, item_to_index,
     return pd.Series(scores, index=candidate_ids).sort_values(ascending=False)
 
 
-def recommend_ncf(model, user_id, interactions_df, items_df, user_to_index,
-                  item_to_index, top_n=10, feedback_type="explicit", device=None):
-    """Top-N NCF recommendations, joined back to the catalogue."""
+def recommend_ncf(model, user_id: int, interactions_df: pd.DataFrame, items_df: pd.DataFrame,
+                  user_to_index: dict, item_to_index: dict, top_n: int = 10,
+                  feedback_type: str = "explicit", device: str = None) -> pd.DataFrame:
+    """Top-N NCF recommendations joined back to the catalogue."""
     seen = interactions_df.loc[interactions_df["user_id"] == user_id, "item_id"].unique().tolist()
 
     scores = score_all_items(model, user_id, user_to_index, item_to_index,
@@ -547,21 +467,16 @@ def recommend_ncf(model, user_id, interactions_df, items_df, user_to_index,
 # =========================================================
 # PERSISTENCE
 # =========================================================
-def save_ncf_artifacts(model, history, feedback_type, tag="ncf"):
-    """
-    Persist the state_dict, not the model object.
-
-    Saving the whole object pickles the class definition with it, so any later
-    refactor of this file silently breaks loading. A state_dict is just tensors;
-    it reloads into a freshly constructed model of the same shape.
-    """
+def save_ncf_artifacts(model, history: dict, feedback_type: str, tag: str = "ncf") -> None:
+    """Persist weights, history and the architecture spec."""
+    # state_dict, not the model object: pickling the class means any later
+    # refactor of this file silently breaks loading.
     torch.save(model.state_dict(),
                os.path.join(PROCESSED_DATA_PATH, tag + "_model_" + feedback_type + ".pt"))
     save_pickle(history, tag + "_history_" + feedback_type + ".pkl")
 
-    # Read the architecture back off the model itself rather than off the module
-    # constants, so a model trained with overridden hyperparameters reloads as
-    # what it actually is rather than as what the defaults say it should be.
+    # Read architecture off the model, not the constants, so an overridden
+    # model reloads as what it actually is.
     dropout_layers = [m.p for m in model.mlp if isinstance(m, nn.Dropout)]
     hidden_dims = [m.out_features for m in model.mlp if isinstance(m, nn.Linear)]
 
@@ -578,8 +493,8 @@ def save_ncf_artifacts(model, history, feedback_type, tag="ncf"):
     )
 
 
-def load_ncf_model(feedback_type="explicit", tag="ncf"):
-    """Rebuild the model from its saved architecture spec and load the weights."""
+def load_ncf_model(feedback_type: str = "explicit", tag: str = "ncf") -> nn.Module:
+    """Rebuild the model from its saved spec and load the weights."""
     arch = load_pickle(tag + "_architecture_" + feedback_type + ".pkl")
     weights_path = os.path.join(PROCESSED_DATA_PATH,
                                 tag + "_model_" + feedback_type + ".pt")
@@ -606,26 +521,23 @@ def load_ncf_model(feedback_type="explicit", tag="ncf"):
 # =========================================================
 # TRAINING ENTRY POINT
 # =========================================================
-def train_and_save(feedback_type="explicit", tag="ncf"):
+def train_and_save(feedback_type: str = "explicit", tag: str = "ncf"):
+    """Train one variant end to end and save it."""
     users_df, items_df, interactions_df = load_all()
 
     print("\nTraining NCF ({} feedback) on {}".format(feedback_type, get_device()))
 
     encoded, user_to_index, item_to_index, _, _ = encode_ids(interactions_df, tag=tag)
 
-    # Train only on the training period; the recent window stays untouched for
-    # the ranking evaluation.
     train_period, _, cutoff = time_based_split(encoded)
     print("  training period ends {} ({:,} interactions)".format(
         cutoff.date(), len(train_period)))
 
     if feedback_type == "implicit":
-        # Negatives are sampled BEFORE the train/valid split so that both folds
-        # contain the same positive-to-negative ratio, keeping the validation
-        # loss comparable to the training loss.
+        # Sample negatives before the split so both folds share the ratio.
         sampled = build_implicit_training_frame(train_period, num_items=len(item_to_index))
         positives = int(sampled["label"].sum())
-        print("  negative sampling: {:,} positives + {:,} sampled negatives (1:{})".format(
+        print("  negative sampling: {:,} positives + {:,} negatives (1:{})".format(
             positives, len(sampled) - positives, NUM_NEGATIVES))
         train_df, valid_df = train_valid_split(sampled)
         dropout = IMPLICIT_DROPOUT
@@ -669,13 +581,16 @@ def train_and_save(feedback_type="explicit", tag="ncf"):
 
     print("\n  training time: {:.1f}s over {} epochs".format(
         training_seconds, len(history["train_loss"])))
-    print("  validation metrics:",
-          {k: round(v, 4) for k, v in metrics.items()})
+    print("  validation metrics:", {k: round(v, 4) for k, v in metrics.items()})
 
     return model, history, metrics, user_to_index, item_to_index, items_df, interactions_df
 
 
-def main():
+# =========================================================
+# MAIN
+# =========================================================
+def main() -> None:
+    """Train both variants and show sample recommendations."""
     for feedback_type in ("explicit", "implicit"):
         result = train_and_save(feedback_type)
         model, history, metrics, user_to_index, item_to_index, items_df, interactions_df = result
